@@ -6,16 +6,17 @@
 # remote nodes.
 
 # The java implementation to use.  Required.
-# export JAVA_HOME=/usr/lib/j2sdk1.5-sun
+export JAVA_HOME=/usr/lib/jvm/java-1.6.0
 
 # Extra Java CLASSPATH elements.  Optional.
 # export HADOOP_CLASSPATH=
 
 # The maximum amount of heap to use, in MB. Default is 1000.
-# export HADOOP_HEAPSIZE=2000
+export HADOOP_HEAPSIZE=1000
 
 # Extra Java runtime options.  Empty by default.
 # export HADOOP_OPTS=-server
+export HADOOP_OPTS="-Djava.net.preferIPv4Stack=true"
 
 # Command specific options appended to HADOOP_OPTS when specified
 export HADOOP_NAMENODE_OPTS="-Dcom.sun.management.jmxremote $HADOOP_NAMENODE_OPTS"
@@ -23,29 +24,17 @@ export HADOOP_SECONDARYNAMENODE_OPTS="-Dcom.sun.management.jmxremote $HADOOP_SEC
 export HADOOP_DATANODE_OPTS="-Dcom.sun.management.jmxremote $HADOOP_DATANODE_OPTS"
 export HADOOP_BALANCER_OPTS="-Dcom.sun.management.jmxremote $HADOOP_BALANCER_OPTS"
 export HADOOP_JOBTRACKER_OPTS="-Dcom.sun.management.jmxremote $HADOOP_JOBTRACKER_OPTS"
-export HADOOP_RAIDNODE_OPTS="-Dcom.sun.management.jmxremote $HADOOP_RAIDNODE_OPTS"
-export HADOOP_NAMENODE_OPTS="-Dcom.sun.management.jmxremote.port=8998 -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false"
-
-# The only user who can start hadoop daemons. 
-# If this is not set, any user can start hadoop daemons.  
-export HADOOP_USERNAME="hadoop"
-
-# Java Runtime garbage collection options to pass to all Hadoop
-# servers (Namenode, Jobtracker, Datanode, Tasktracker). This must end
-# with a colon ; to which the dynamically generated gc log filename will
-# be appended to. The below defaults work for the Sun JVM, for example
-# in IBM GC, use '-Xverbosegclog:'.
-#export HADOOP_GC_LOG_OPTS="-XX:+PrintGCDateStamps -XX:+PrintGCDetails -Xloggc:"
-
 # export HADOOP_TASKTRACKER_OPTS=
 # The following applies to multiple commands (fs, dfs, fsck, distcp etc)
 # export HADOOP_CLIENT_OPTS
 
 # Extra ssh options.  Empty by default.
 # export HADOOP_SSH_OPTS="-o ConnectTimeout=1 -o SendEnv=HADOOP_CONF_DIR"
+export HADOOP_SSH_OPTS="-o ConnectTimeout=5"
 
 # Where log files are stored.  $HADOOP_HOME/logs by default.
 # export HADOOP_LOG_DIR=${HADOOP_HOME}/logs
+export HADOOP_LOG_DIR=/mnt/ephemeral-hdfs/logs
 
 # File naming remote slave hosts.  $HADOOP_HOME/conf/slaves by default.
 # export HADOOP_SLAVES=${HADOOP_HOME}/conf/slaves
@@ -59,10 +48,20 @@ export HADOOP_USERNAME="hadoop"
 # export HADOOP_SLAVE_SLEEP=0.1
 
 # The directory where pid files are stored. /tmp by default.
-# export HADOOP_PID_DIR=/var/hadoop/pids
+export HADOOP_PID_DIR=/var/hadoop/ephemeral-hdfs/pids
 
 # A string representing this instance of hadoop. $USER by default.
 # export HADOOP_IDENT_STRING=$USER
 
 # The scheduling priority for daemon processes.  See 'man nice'.
 # export HADOOP_NICENESS=10
+
+# Set hadoop user for CDH (which doesn't allow running as root)
+export HADOOP_NAMENODE_USER=hadoop
+export HADOOP_DATANODE_USER=hadoop
+export HADOOP_SECONDARYNAMENODE_USER=hadoop
+export HADOOP_JOBTRACKER_USER=hadoop
+export HADOOP_TASKTRACKER_USER=hadoop
+
+ulimit -n 16000
+

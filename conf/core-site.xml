@@ -5,9 +5,20 @@
 
 <configuration>
 
-<property>
-   <name>fs.default.name</name>
-   <value>hdfs://localhost:9000</value>
-</property>
+  <property>
+    <name>fs.default.name</name>
+    <value>hdfs://localhost:9000</value>
+  </property>
+
+  <property>
+    <name>hadoop.tmp.dir</name>
+    <value>/mnt/ephemeral-hdfs</value>
+  </property>
+
+  <property>
+    <name>io.file.buffer.size</name>
+    <value>65536</value>
+  </property>
 
 </configuration>
+
