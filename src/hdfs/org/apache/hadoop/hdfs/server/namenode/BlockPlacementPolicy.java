@@ -17,6 +17,7 @@
  */
 package org.apache.hadoop.hdfs.server.namenode;
 
+import org.apache.commons.logging.*;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
@@ -26,6 +27,7 @@ import org.apache.hadoop.net.NetworkTopology;
 import org.apache.hadoop.net.Node; 
 import org.apache.hadoop.util.HostsFileReader;
 import org.apache.hadoop.util.ReflectionUtils;
+
 import java.util.*;
 
 /** 
@@ -34,6 +36,7 @@ import java.util.*;
  */
 public abstract class BlockPlacementPolicy {
   
+  public static final Log LOG = LogFactory.getLog(BlockPlacementPolicy.class.getName());
   // Keep track of receiving throughput at each DataNode
   public Map<String, Double> dnNameToRxBpsMap = Collections.synchronizedMap(new HashMap<String, Double>());
   
@@ -223,5 +226,6 @@ public abstract class BlockPlacementPolicy {
    */
   public void updateNetworkInformation(String dnName, double rxBps) {
     dnNameToRxBpsMap.put(dnName, rxBps);
+    // LOG.info(dnName + ": RxBps: " + rxBps);
   }
 }

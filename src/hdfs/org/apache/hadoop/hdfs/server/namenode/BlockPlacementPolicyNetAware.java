@@ -388,6 +388,8 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
       if (candRxBps <= minRxBps) {
         retVal = cand;
       }
+      LOG.info("pickMinLoadedNode examining " + cand.getName()
+          + " with RxBps = " + candRxBps);
     }    
     return (DatanodeDescriptor) retVal;
   }

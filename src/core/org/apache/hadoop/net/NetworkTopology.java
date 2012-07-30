@@ -52,6 +52,7 @@ public class NetworkTopology {
    */
   private class InnerNode extends NodeBase {
     private ArrayList<Node> children=new ArrayList<Node>();
+    private ArrayList<Node> leaves=new ArrayList<Node>();
     private int numOfLeaves;
         
     /** Construct an InnerNode from a path-like string */
@@ -73,6 +74,9 @@ public class NetworkTopology {
     /** Get its children */
     Collection<Node> getChildren() {return children;}
         
+    /** Get its leaves */
+    Collection<Node> getLeaves() {return leaves;}
+
     /** Return the number of children this node has */
     int getNumOfChildren() {
       return children.size();
@@ -151,6 +155,7 @@ public class NetworkTopology {
         }
         children.add(n);
         numOfLeaves++;
+        leaves.add(n);
         return true;
       } else {
         // find the next ancestor node
@@ -171,6 +176,7 @@ public class NetworkTopology {
         // add n to the subtree of the next ancestor node
         if (parentNode.add(n)) {
           numOfLeaves++;
+          leaves.add(n);
           return true;
         } else {
           return false;
@@ -199,6 +205,13 @@ public class NetworkTopology {
             return true;
           }
         }
+        // remove from leaves
+        for (int i=0; i<leaves.size(); i++) {
+          if (leaves.get(i).getName().equals(n.getName())) {
+            leaves.remove(i);
+            break;
+          }
+        }
         return false;
       } else {
         // find the next ancestor node: the parent node
@@ -222,6 +235,7 @@ public class NetworkTopology {
             children.remove(i);
           }
           numOfLeaves--;
+          // MOS: Remove from leaves
         }
         return isRemoved;
       }
@@ -629,28 +643,39 @@ public class NetworkTopology {
       scope=scope.substring(1);
     }
     scope = NodeBase.normalize(scope);
-    ArrayList<Node> candidates = null;
+    int count=0; // the number of nodes in both scope & excludedNodes
+    ArrayList<Node> nodesInBoth = new ArrayList<Node>();
+    ArrayList<Node> retVal = null;
     netlock.readLock().lock();
     try {
+      for(Node node:excludedNodes) {
+        if ((NodeBase.getPath(node)+NodeBase.PATH_SEPARATOR_STR).
+            startsWith(scope+NodeBase.PATH_SEPARATOR_STR)) {
+          nodesInBoth.add(node);
+          count++;
+        }
+      }
       Node scopeNode=getNode(scope);
+      int scopeNodeCount=1;
       ArrayList<Node> nodesInScope = new ArrayList<Node>();
       nodesInScope.add(scopeNode);
       if (scopeNode instanceof InnerNode) {
-        nodesInScope.addAll(((InnerNode)scopeNode).getChildren());
+        scopeNodeCount=((InnerNode)scopeNode).getNumOfLeaves();
+        nodesInScope.remove(0);
+        nodesInScope.addAll(((InnerNode)scopeNode).getLeaves());
       }
       if (isExcluded) {
-        candidates = new ArrayList<Node>(clusterMap.getChildren());
-        candidates.removeAll(nodesInScope);
-        candidates.removeAll(excludedNodes);
+        int x = clusterMap.getNumOfLeaves()-scopeNodeCount-excludedNodes.size()+count;
+        retVal = new ArrayList<Node>(clusterMap.getLeaves());
+        retVal.removeAll(nodesInScope);
+        retVal.removeAll(excludedNodes);
+        retVal.addAll(nodesInBoth);
+        // LOG.info(x + " == " + retVal.size());
       } else {
-        candidates = new ArrayList<Node>(nodesInScope);
-        candidates.removeAll(excludedNodes);
-      }
-      ArrayList<Node> retVal = new ArrayList<Node>();
-      for (Node cand: candidates) {
-        if (!(cand instanceof InnerNode)) {
-          retVal.add(cand);
-        }
+        int y = scopeNodeCount-count;
+        retVal = new ArrayList<Node>(nodesInScope);
+        retVal.removeAll(nodesInBoth);
+        // LOG.info(y + " == " + retVal.size());
       }
       return retVal;
     } finally {
