@@ -1309,9 +1309,12 @@ public class NameNode extends ReconfigurableBase
                                        long remaining,
                                        long namespaceUsed,
                                        int xmitsInProgress,
-                                       int xceiverCount) throws IOException {
+                                       int xceiverCount,
+                                       double rxBps,
+                                       double txBps) throws IOException {
     verifyRequest(nodeReg);
     myMetrics.numHeartbeat.inc();
+    getBlockPlacementPolicy().updateNetworkInformation(nodeReg.getName(), rxBps);
     return namesystem.handleHeartbeat(nodeReg, capacity, dfsUsed, remaining, namespaceUsed,
         xceiverCount, xmitsInProgress);
   }

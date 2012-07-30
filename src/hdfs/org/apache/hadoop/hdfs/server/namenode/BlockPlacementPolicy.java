@@ -33,7 +33,10 @@ import java.util.*;
  * for placing block replicas.
  */
 public abstract class BlockPlacementPolicy {
-    
+  
+  // Keep track of receiving throughput at each DataNode
+  public Map<String, Double> dnNameToRxBpsMap = Collections.synchronizedMap(new HashMap<String, Double>());
+  
   public static class NotEnoughReplicasException extends Exception {
     private static final long serialVersionUID = 1L;
     NotEnoughReplicasException(String msg) {
@@ -210,5 +213,15 @@ public abstract class BlockPlacementPolicy {
     return chooseTarget(srcPath, numOfReplicas, writer,
                         new ArrayList<DatanodeDescriptor>(),
                         blocksize);
+  }
+  
+  /**
+   * Update dnPathToRxBpsMap 
+   * 
+   * @param dnName path to DataNode
+   * @param rxBps receiving throughout of the DataNode
+   */
+  public void updateNetworkInformation(String dnName, double rxBps) {
+    dnNameToRxBpsMap.put(dnName, rxBps);
   }
 }

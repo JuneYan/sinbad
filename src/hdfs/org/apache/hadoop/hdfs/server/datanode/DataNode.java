@@ -18,10 +18,12 @@
 package org.apache.hadoop.hdfs.server.datanode;
 
 import java.io.BufferedOutputStream;
+import java.io.BufferedReader;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.lang.reflect.Proxy;
 import java.net.InetSocketAddress;
@@ -252,6 +254,15 @@ public class DataNode extends Configured
   Configuration conf;
   private PulseChecker pulseChecker;
 
+  // For calculating network speed
+  private double lastRxBytes = -1;
+  private double lastTxBytes = -1;
+  private long lastTimeRxCalcMillis = -1;
+  private long lastTimeTxCalcMillis = -1;
+
+  private String commandToGetRxBytes = "ifconfig eth0 | grep \"RX bytes\" | cut -d: -f2 | awk '{ print $1 }'"; 
+  private String commandToGetTxBytes = "ifconfig eth0 | grep \"TX bytes\" | cut -d: -f3 | awk '{ print $1 }'";
+  
   /**
    * Current system time.
    * @return current time in msec.
@@ -277,6 +288,12 @@ public class DataNode extends Configured
    // datanodes should wait for. Default is 5 minutes.
    blockCopyRPCWaitTime = conf.getInt("dfs.datanode.blkcopy.wait_time",
        5 * 60);
+   
+   // Set initial values for rxBytes and txBytes
+   lastTimeRxCalcMillis = lastTimeTxCalcMillis = now();
+   lastRxBytes = Double.parseDouble(getValueFromCommandLine(commandToGetRxBytes));
+   lastTxBytes = Double.parseDouble(getValueFromCommandLine(commandToGetTxBytes));
+   
    try {
      startDataNode(conf, dataDirs);
    } catch (IOException ie) {
@@ -809,7 +826,22 @@ public class DataNode extends Configured
     return threadGroup == null ? 0 : threadGroup.activeCount();
   }
 
+  String getValueFromCommandLine(String commandToRun) {
+    String retVal = null;
+    try {
+      ProcessBuilder pb = new ProcessBuilder("/bin/sh", "-c", commandToRun);
+      Process p = pb.start();
 
+      BufferedReader stdInput = new BufferedReader(new InputStreamReader(p.getInputStream()));
+
+      while ((retVal = stdInput.readLine()) != null) {
+        break;
+      }
+    } catch (Exception e) {
+      e.printStackTrace();
+    }
+    return retVal;
+  }
   
   /**
    * A thread per namenode to perform:
@@ -863,6 +895,30 @@ public class DataNode extends Configured
       this.nsRegistration.setName(name);
     }
 
+    private double getRxBps() {
+      long curTime = now();
+      double secondsElapsed = (curTime - lastTimeRxCalcMillis) / 1000.0;
+      lastTimeRxCalcMillis = curTime;
+      
+      double curRxBytes = Double.parseDouble(getValueFromCommandLine(commandToGetRxBytes));
+      double rxBps = (curRxBytes - lastRxBytes) / secondsElapsed;
+      lastRxBytes = curRxBytes;
+      LOG.info("Rx: " + rxBps + "bps");
+      return rxBps;
+    }
+
+    private double getTxBps() {
+      long curTime = now();
+      double secondsElapsed = (curTime - lastTimeTxCalcMillis) / 1000.0;
+      lastTimeTxCalcMillis = curTime;
+
+      double curTxBytes = Double.parseDouble(getValueFromCommandLine(commandToGetTxBytes));
+      double txBps = (curTxBytes - lastTxBytes) / secondsElapsed;
+      lastTxBytes = curTxBytes;
+      LOG.info("Tx: " + txBps + "bps");
+      return txBps;
+    }
+
     /**
      * Main loop for each NS thread. Run until shutdown,
      * forever calling remote NameNode functions.
@@ -902,7 +958,9 @@ public class DataNode extends Configured
                                                          data.getRemaining(),
                                                          data.getNSUsed(namespaceId),
                                                          xmitsInProgress.get(),
-                                                         getXceiverCount());
+                                                         getXceiverCount(),
+                                                         getRxBps(),
+                                                         getTxBps());
             this.lastBeingAlive = now();
             LOG.debug("Sent heartbeat at " + this.lastBeingAlive);
             myMetrics.heartbeats.inc(now() - startTime);

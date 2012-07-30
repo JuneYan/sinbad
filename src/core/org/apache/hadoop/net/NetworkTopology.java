@@ -19,6 +19,7 @@ package org.apache.hadoop.net;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
@@ -293,7 +294,7 @@ public class NetworkTopology {
         return null;
       }
     }
-        
+     
     int getNumOfLeaves() {
       return numOfLeaves;
     }
@@ -613,6 +614,50 @@ public class NetworkTopology {
     }
   }
     
+  /** return all the leaves in <i>scope</i> but not in <i>excludedNodes</i>
+   * if scope starts with ~, return all the leaves that are not
+   * in <i>scope</i> and <i>excludedNodes</i>; 
+   * @param scope a path string that may start with ~
+   * @param excludedNodes a list of nodes
+   * @return available nodes
+   */
+  public Collection<Node> getAvailableLeaves(String scope, 
+                                            Collection<Node> excludedNodes) {
+    boolean isExcluded=false;
+    if (scope.startsWith("~")) {
+      isExcluded=true;
+      scope=scope.substring(1);
+    }
+    scope = NodeBase.normalize(scope);
+    ArrayList<Node> candidates = null;
+    netlock.readLock().lock();
+    try {
+      Node scopeNode=getNode(scope);
+      ArrayList<Node> nodesInScope = new ArrayList<Node>();
+      nodesInScope.add(scopeNode);
+      if (scopeNode instanceof InnerNode) {
+        nodesInScope.addAll(((InnerNode)scopeNode).getChildren());
+      }
+      if (isExcluded) {
+        candidates = new ArrayList<Node>(clusterMap.getChildren());
+        candidates.removeAll(nodesInScope);
+        candidates.removeAll(excludedNodes);
+      } else {
+        candidates = new ArrayList<Node>(nodesInScope);
+        candidates.removeAll(excludedNodes);
+      }
+      ArrayList<Node> retVal = new ArrayList<Node>();
+      for (Node cand: candidates) {
+        if (!(cand instanceof InnerNode)) {
+          retVal.add(cand);
+        }
+      }
+      return retVal;
+    } finally {
+      netlock.readLock().unlock();      
+    }
+  }
+
   /** convert a network tree to a string */
   public String toString() {
     // print the number of racks
