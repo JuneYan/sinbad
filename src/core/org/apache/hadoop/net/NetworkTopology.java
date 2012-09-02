@@ -677,7 +677,7 @@ public class NetworkTopology {
         retVal.removeAll(nodesInBoth);
         // LOG.info(y + " == " + retVal.size());
       }
-      return retVal;
+      return new HashSet<Node>(retVal);
     } finally {
       netlock.readLock().unlock();      
     }
