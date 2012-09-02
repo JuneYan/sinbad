@@ -227,7 +227,7 @@ public abstract class BlockPlacementPolicy {
    * @param rxBps receiving throughout of the DataNode
    */
   public void updateNetworkInformation(String dnName, double newRxBps) {
-    double oldRxBps = dnNameToRxBpsMap.get(dnName);
+    double oldRxBps = (dnNameToRxBpsMap.containsKey(dnName)) ? dnNameToRxBpsMap.get(dnName) : 0.0;
     double rxBps = (1.0 - this.oldFactor) * newRxBps + this.oldFactor * oldRxBps;
     dnNameToRxBpsMap.put(dnName, rxBps);
     LOG.info(dnName + ": updatedRxBps = " + rxBps + ". oldRxBps = " + oldRxBps + ". oldFactor = " + this.oldFactor);
