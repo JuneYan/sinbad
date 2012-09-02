@@ -91,6 +91,8 @@ public interface AvatarProtocol extends ClientProtocol {
                                        long dfsUsed, long remaining,
                                        long namespaceUsed,
                                        int xmitsInProgress,
-                                       int xceiverCount) throws IOException;
+                                       int xceiverCount,
+                                       double rxBps,
+                                       double txBps) throws IOException;
 }
 

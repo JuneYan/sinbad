@@ -482,10 +482,12 @@ public class AvatarNode extends NameNode
                                        long dfsUsed, long remaining,
                                        long namespaceUsed,
                                        int xmitsInProgress,
-                                       int xceiverCount) throws IOException {
+                                       int xceiverCount,
+                                       double rxBps,
+                                       double txBps) throws IOException {
     DatanodeCommand[] cmds = super.sendHeartbeat(
             registration, capacity, dfsUsed, remaining, namespaceUsed,
-            xmitsInProgress, xceiverCount);
+            xmitsInProgress, xceiverCount, rxBps, txBps);
     if (ignoreDatanodes()) {
       if (cmds == null) {
         return new DatanodeCommand[]{AvatarDatanodeCommand.BACKOFF};
