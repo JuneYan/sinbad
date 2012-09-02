@@ -148,12 +148,20 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     results.removeAll(chosenNodes);
       
     // sorting nodes to form a pipeline
-    return getPipeline((writer==null)?localNode:writer,
+    DatanodeDescriptor[] selectedOnes = getPipeline((writer==null)?localNode:writer,
                        results.toArray(new DatanodeDescriptor[results.size()]));
+    
+    // Update network usage of the selected ones 
+    for (DatanodeDescriptor dd: selectedOnes) {
+      // Set new RxBps to 128MBps (Will push it to the end)
+      updateNetworkInformation(dd.getName(), 128 * 1024 * 1024);
+    }
+    
+    return selectedOnes;
   }
     
   /* choose <i>numOfReplicas</i> from all data nodes */
-  protected DatanodeDescriptor chooseTarget(int numOfReplicas,
+  protected synchronized DatanodeDescriptor chooseTarget(int numOfReplicas,
                                           DatanodeDescriptor writer,
                                           HashMap<Node, Node> excludedNodes,
                                           long blocksize,
@@ -390,10 +398,13 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
       }
       if (candRxBps <= minRxBps) {
         retVal = cand;
+        minRxBps = candRxBps;
       }
       LOG.info("pickMinLoadedNode examining " + cand.getName()
           + " with RxBps = " + candRxBps);
-    }    
+    }
+    LOG.info("pickMinLoadedNode selected " + retVal.getName()
+        + " with RxBps = " + minRxBps);
     return (DatanodeDescriptor) retVal;
   }
   
