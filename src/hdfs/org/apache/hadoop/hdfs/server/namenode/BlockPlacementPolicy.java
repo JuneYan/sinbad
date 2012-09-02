@@ -40,6 +40,8 @@ public abstract class BlockPlacementPolicy {
   // Keep track of receiving throughput at each DataNode
   public Map<String, Double> dnNameToRxBpsMap = Collections.synchronizedMap(new HashMap<String, Double>());
   
+  public double oldFactor = 0.0;
+
   public static class NotEnoughReplicasException extends Exception {
     private static final long serialVersionUID = 1L;
     NotEnoughReplicasException(String msg) {
@@ -224,8 +226,10 @@ public abstract class BlockPlacementPolicy {
    * @param dnName path to DataNode
    * @param rxBps receiving throughout of the DataNode
    */
-  public void updateNetworkInformation(String dnName, double rxBps) {
+  public void updateNetworkInformation(String dnName, double newRxBps) {
+    double oldRxBps = dnNameToRxBpsMap.get(dnName);
+    double rxBps = (1.0 - this.oldFactor) * newRxBps + this.oldFactor * oldRxBps;
     dnNameToRxBpsMap.put(dnName, rxBps);
-    // LOG.info(dnName + ": RxBps: " + rxBps);
+    LOG.info(dnName + ": updatedRxBps = " + rxBps + ". oldRxBps = " + oldRxBps + ". oldFactor = " + this.oldFactor);
   }
 }

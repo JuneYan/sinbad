@@ -59,6 +59,9 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
   public void initialize(Configuration conf, FSClusterStats stats,
       NetworkTopology clusterMap, HostsFileReader hostsReader,
       DNSToSwitchMapping dnsToSwitchMapping, FSNamesystem ns) {
+    // First, set oldFactor in the superclass BlockPlacementPolicy
+    super.oldFactor = conf.getFloat("dfs.replication.netaware.oldfactor", (float) 0.2);
+    // Then, do everything else
     this.clusterMap = clusterMap;
     Configuration newConf = new Configuration();
     this.attemptMultiplier = newConf.getInt("dfs.replication.attemptMultiplier", 200);
