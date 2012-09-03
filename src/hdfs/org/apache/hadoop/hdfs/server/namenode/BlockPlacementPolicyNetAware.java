@@ -153,8 +153,12 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     
     // Update network usage of the selected ones 
     for (DatanodeDescriptor dd: selectedOnes) {
-      // Set new RxBps to 128MBps (Will push it to the end)
-      updateNetworkInformation(dd.getName(), 128 * 1024 * 1024);
+      // Set new RxBps to blocksize / 2 Bps (Will push it toward the end)
+      double newRxBps = 0.5 * blocksize;
+      // NIC speed is 1Gbps = 128MBps
+      double nicSpeed = 128.0 * 1024 * 1024; 
+
+      updateNetworkInformation(dd.getName(), newRxBps > nicSpeed ? nicSpeed : newRxBps);
     }
     
     return selectedOnes;
