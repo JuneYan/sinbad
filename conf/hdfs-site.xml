@@ -43,5 +43,10 @@
     <value>0.2</value>
   </property>
 
+  <property>
+    <name>dfs.heartbeat.interval</name>
+    <value>1</value>
+  </property>
+
 </configuration>
 
