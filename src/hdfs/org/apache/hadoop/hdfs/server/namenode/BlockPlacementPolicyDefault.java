@@ -104,7 +104,7 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
   /**
    * This is not part of the public API but is used by the unit tests.
    */
-  DatanodeDescriptor[] chooseTarget(int numOfReplicas,
+  synchronized DatanodeDescriptor[] chooseTarget(int numOfReplicas,
                                     DatanodeDescriptor writer,
                                     List<DatanodeDescriptor> chosenNodes,
                                     List<Node> exlcNodes,
