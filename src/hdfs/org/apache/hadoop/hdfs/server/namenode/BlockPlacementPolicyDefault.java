@@ -146,8 +146,18 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
     results.removeAll(chosenNodes);
       
     // sorting nodes to form a pipeline
-    return getPipeline((writer==null)?localNode:writer,
+    DatanodeDescriptor[] selectedOnes = getPipeline((writer==null)?localNode:writer,
                        results.toArray(new DatanodeDescriptor[results.size()]));
+
+    // Update network usage of the selected ones 
+    for (DatanodeDescriptor dd: selectedOnes) {
+      // Bump up the RxBps based on blocksize
+      LOG.info("chooseTarget selected " + dd.getName()
+          + " with RxBps = " + (dnNameToRxBpsMap.containsKey(dd.getName()) ? dnNameToRxBpsMap.get(dd.getName()) : 0.0));
+      adjustRxBps(dd.getName(), blocksize);
+    }
+    
+    return selectedOnes;
   }
     
   /* choose <i>numOfReplicas</i> from all data nodes */

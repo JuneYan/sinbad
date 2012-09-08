@@ -154,6 +154,8 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     // Update network usage of the selected ones 
     for (DatanodeDescriptor dd: selectedOnes) {
       // Bump up the RxBps based on blocksize
+      LOG.info("chooseTarget selected " + dd.getName()
+          + " with RxBps = " + (dnNameToRxBpsMap.containsKey(dd.getName()) ? dnNameToRxBpsMap.get(dd.getName()) : 0.0));
       adjustRxBps(dd.getName(), blocksize);
     }
     
@@ -400,11 +402,11 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
         retVal = cand;
         minRxBps = candRxBps;
       }
-      LOG.info("pickMinLoadedNode examining " + cand.getName()
-          + " with RxBps = " + candRxBps);
+//      LOG.info("pickMinLoadedNode examining " + cand.getName()
+//          + " with RxBps = " + candRxBps);
     }
-    LOG.info("pickMinLoadedNode selected " + retVal.getName()
-        + " with RxBps = " + minRxBps);
+//    LOG.info("pickMinLoadedNode selected " + retVal.getName()
+//        + " with RxBps = " + minRxBps);
     return (DatanodeDescriptor) retVal;
   }
   
