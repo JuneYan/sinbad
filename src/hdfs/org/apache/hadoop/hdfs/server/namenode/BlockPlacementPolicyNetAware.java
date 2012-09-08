@@ -106,7 +106,7 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
   /**
    * This is not part of the public API but is used by the unit tests.
    */
-  DatanodeDescriptor[] chooseTarget(int numOfReplicas,
+  synchronized DatanodeDescriptor[] chooseTarget(int numOfReplicas,
                                     DatanodeDescriptor writer,
                                     List<DatanodeDescriptor> chosenNodes,
                                     List<Node> exlcNodes,
@@ -153,19 +153,15 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     
     // Update network usage of the selected ones 
     for (DatanodeDescriptor dd: selectedOnes) {
-      // Set new RxBps to blocksize / 2 Bps (Will push it toward the end)
-      double newRxBps = 0.5 * blocksize;
-      // NIC speed is 1Gbps = 128MBps
-      double nicSpeed = 128.0 * 1024 * 1024; 
-
-      updateNetworkInformation(dd.getName(), newRxBps > nicSpeed ? nicSpeed : newRxBps);
+      // Bump up the RxBps based on blocksize
+      adjustRxBps(dd.getName(), blocksize);
     }
     
     return selectedOnes;
   }
     
   /* choose <i>numOfReplicas</i> from all data nodes */
-  protected synchronized DatanodeDescriptor chooseTarget(int numOfReplicas,
+  protected DatanodeDescriptor chooseTarget(int numOfReplicas,
                                           DatanodeDescriptor writer,
                                           HashMap<Node, Node> excludedNodes,
                                           long blocksize,

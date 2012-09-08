@@ -232,4 +232,12 @@ public abstract class BlockPlacementPolicy {
     dnNameToRxBpsMap.put(dnName, rxBps);
     // LOG.info(dnName + ": updatedRxBps = " + rxBps + " oldRxBps = " + oldRxBps + " oldFactor = " + this.oldFactor);
   }
+  
+  public void adjustRxBps(String dnName, double blocksize) {
+    double oldRxBps = (dnNameToRxBpsMap.containsKey(dnName)) ? dnNameToRxBpsMap.get(dnName) : 0.0;
+    double toAdd = blocksize * 0.5; // Default blocksize is 256MB
+    double newRxBps = oldRxBps + toAdd;
+    double nicSpeed = 128.0 * 1024 * 1024;  // 1Gbps == 128MBps 
+    dnNameToRxBpsMap.put(dnName, (newRxBps > nicSpeed) ? nicSpeed : newRxBps);
+  }
 }
