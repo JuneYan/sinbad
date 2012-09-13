@@ -39,6 +39,7 @@ public abstract class BlockPlacementPolicy {
   public static final Log LOG = LogFactory.getLog(BlockPlacementPolicy.class.getName());
   // Keep track of receiving throughput at each DataNode
   public Map<String, Double> dnNameToRxBpsMap = Collections.synchronizedMap(new HashMap<String, Double>());
+  public Map<String, Double> dnNameToTxBpsMap = Collections.synchronizedMap(new HashMap<String, Double>());
   
   public double oldFactor = 0.0;
 
@@ -225,13 +226,18 @@ public abstract class BlockPlacementPolicy {
    * 
    * @param dnName path to DataNode
    * @param rxBps receiving throughout of the DataNode
+   * @param txBps transmitting throughput of the DataNode
    */
-  public void updateNetworkInformation(String dnName, double newRxBps) {
+  public void updateNetworkInformation(String dnName, double newRxBps, double newTxBps) {
     double oldRxBps = (dnNameToRxBpsMap.containsKey(dnName)) ? dnNameToRxBpsMap.get(dnName) : 0.0;
     double rxBps = (1.0 - this.oldFactor) * newRxBps + this.oldFactor * oldRxBps;
     dnNameToRxBpsMap.put(dnName, rxBps);
+    double oldTxBps = (dnNameToTxBpsMap.containsKey(dnName)) ? dnNameToTxBpsMap.get(dnName) : 0.0;
+    double txBps = (1.0 - this.oldFactor) * newTxBps + this.oldFactor * oldTxBps;
+    dnNameToTxBpsMap.put(dnName, txBps);
+
     // LOG.info(dnName + ": updatedRxBps = " + rxBps + " oldRxBps = " + oldRxBps + " oldFactor = " + this.oldFactor);
-  }
+}
   
   public void adjustRxBps(String dnName, double blocksize) {
     double oldRxBps = (dnNameToRxBpsMap.containsKey(dnName)) ? dnNameToRxBpsMap.get(dnName) : 0.0;

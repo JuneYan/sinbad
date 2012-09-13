@@ -211,7 +211,7 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
         }
       }
       chooseNetworkAware(numOfReplicas, NodeBase.ROOT, excludedNodes, 
-                   blocksize, maxNodesPerRack, results);
+                   blocksize, maxNodesPerRack, results, writer);
     } catch (NotEnoughReplicasException e) {
       FSNamesystem.LOG.warn("Not able to place enough replicas, still in need of "
                + numOfReplicas);
@@ -234,7 +234,7 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     // if no local machine, choose a node using network awareness
     if (localMachine == null)
       return chooseNetworkAware(NodeBase.ROOT, excludedNodes, 
-                          blocksize, maxNodesPerRack, results);
+                          blocksize, maxNodesPerRack, results, localMachine);
       
     // otherwise try local machine first
     Node oldNode = excludedNodes.put(localMachine, localMachine);
@@ -265,14 +265,14 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     // no local machine, so choose a node using network awareness
     if (localMachine == null) {
       return chooseNetworkAware(NodeBase.ROOT, excludedNodes, 
-                          blocksize, maxNodesPerRack, results);
+                          blocksize, maxNodesPerRack, results, localMachine);
     }
       
     // choose one from the local rack
     try {
       return chooseNetworkAware(
                           localMachine.getNetworkLocation(),
-                          excludedNodes, blocksize, maxNodesPerRack, results);
+                          excludedNodes, blocksize, maxNodesPerRack, results, localMachine);
     } catch (NotEnoughReplicasException e1) {
       // find the second replica
       DatanodeDescriptor newLocal=null;
@@ -288,16 +288,16 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
         try {
           return chooseNetworkAware(
                               newLocal.getNetworkLocation(),
-                              excludedNodes, blocksize, maxNodesPerRack, results);
+                              excludedNodes, blocksize, maxNodesPerRack, results, localMachine);
         } catch(NotEnoughReplicasException e2) {
           //otherwise choose a node using network awareness
           return chooseNetworkAware(NodeBase.ROOT, excludedNodes,
-                              blocksize, maxNodesPerRack, results);
+                              blocksize, maxNodesPerRack, results, localMachine);
         }
       } else {
         //otherwise choose a node using network awareness
         return chooseNetworkAware(NodeBase.ROOT, excludedNodes,
-                            blocksize, maxNodesPerRack, results);
+                            blocksize, maxNodesPerRack, results, localMachine);
       }
     }
   }
@@ -319,11 +319,11 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     // choose a node using network awareness
     try {
       chooseNetworkAware(numOfReplicas, "~"+localMachine.getNetworkLocation(),
-                   excludedNodes, blocksize, maxReplicasPerRack, results);
+                   excludedNodes, blocksize, maxReplicasPerRack, results, localMachine);
     } catch (NotEnoughReplicasException e) {
       chooseNetworkAware(numOfReplicas-(results.size()-oldNumOfReplicas),
                    localMachine.getNetworkLocation(), excludedNodes, blocksize, 
-                   maxReplicasPerRack, results);
+                   maxReplicasPerRack, results, localMachine);
     }
   }
 
@@ -335,13 +335,14 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
                                           HashMap<Node, Node> excludedNodes,
                                           long blocksize,
                                           int maxNodesPerRack,
-                                          List<DatanodeDescriptor> results) 
+                                          List<DatanodeDescriptor> results,
+                                          DatanodeDescriptor localMachine) 
     throws NotEnoughReplicasException {
     int numOfAvailableNodes =
       clusterMap.countNumOfAvailableNodes(nodes, excludedNodes.keySet());
     while(numOfAvailableNodes > 0) {
       DatanodeDescriptor chosenNode = 
-        pickMinLoadedNode(clusterMap.getAvailableLeaves(nodes, excludedNodes.keySet()));
+        pickMinLoadedNode(clusterMap.getAvailableLeaves(nodes, excludedNodes.keySet()), localMachine);
 
       Node oldNode = excludedNodes.put(chosenNode, chosenNode);
       if (oldNode == null) { // chosenNode was not in the excluded list
@@ -362,7 +363,8 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
                     HashMap<Node, Node> excludedNodes,
                     long blocksize,
                     int maxNodesPerRack,
-                    List<DatanodeDescriptor> results)
+                    List<DatanodeDescriptor> results,
+                    DatanodeDescriptor localMachine)
     throws NotEnoughReplicasException {
 
     int numOfAvailableNodes =
@@ -370,7 +372,7 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     int numAttempts = numOfAvailableNodes * this.attemptMultiplier;
     while(numOfReplicas > 0 && numOfAvailableNodes > 0 && --numAttempts > 0) {
       DatanodeDescriptor chosenNode = 
-        pickMinLoadedNode(clusterMap.getAvailableLeaves(nodes, excludedNodes.keySet()));
+        pickMinLoadedNode(clusterMap.getAvailableLeaves(nodes, excludedNodes.keySet()), localMachine);
       Node oldNode = excludedNodes.put(chosenNode, chosenNode);
       if (oldNode == null) {
         numOfAvailableNodes--;
@@ -390,15 +392,19 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
    * @param candidates 
    * @return
    */
-  private DatanodeDescriptor pickMinLoadedNode(Collection<Node> candidates) {
+  private DatanodeDescriptor pickMinLoadedNode(Collection<Node> candidates, DatanodeDescriptor localMachine) {
     double minRxBps = Double.MAX_VALUE;
     Node retVal = null;
+    
+    // Cap at source's txBps
+    double maxRxBps = dnNameToTxBpsMap.get(localMachine);
+    
     for (Node cand: candidates) {
       Double candRxBps = dnNameToRxBpsMap.get(cand.getName());
       if (candRxBps == null) {
         candRxBps = Double.MAX_VALUE;
       }
-      if (candRxBps <= minRxBps) {
+      if (candRxBps <= minRxBps && candRxBps >= maxRxBps) {
         retVal = cand;
         minRxBps = candRxBps;
       }

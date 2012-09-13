@@ -1314,7 +1314,7 @@ public class NameNode extends ReconfigurableBase
                                        double txBps) throws IOException {
     verifyRequest(nodeReg);
     myMetrics.numHeartbeat.inc();
-    getBlockPlacementPolicy().updateNetworkInformation(nodeReg.getName(), rxBps);
+    getBlockPlacementPolicy().updateNetworkInformation(nodeReg.getName(), rxBps, txBps);
     return namesystem.handleHeartbeat(nodeReg, capacity, dfsUsed, remaining, namespaceUsed,
         xceiverCount, xmitsInProgress);
   }
