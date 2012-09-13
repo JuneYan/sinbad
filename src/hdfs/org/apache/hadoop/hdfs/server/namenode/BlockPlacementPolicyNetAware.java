@@ -397,7 +397,7 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     Node retVal = null;
     
     // Cap at source's txBps
-    double maxRxBps = dnNameToTxBpsMap.get(localMachine);
+    double maxRxBps = dnNameToTxBpsMap.get(localMachine.getName());
     
     for (Node cand: candidates) {
       Double candRxBps = dnNameToRxBpsMap.get(cand.getName());
