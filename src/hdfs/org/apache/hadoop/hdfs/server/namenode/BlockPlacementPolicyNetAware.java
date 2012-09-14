@@ -404,7 +404,7 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
       if (candRxBps == null) {
         candRxBps = Double.MAX_VALUE;
       }
-      if (candRxBps <= minRxBps && candRxBps >= maxRxBps) {
+      if (candRxBps <= minRxBps && (retVal == null || candRxBps >= maxRxBps)) {
         retVal = cand;
         minRxBps = candRxBps;
       }
