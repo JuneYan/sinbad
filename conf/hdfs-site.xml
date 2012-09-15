@@ -15,7 +15,7 @@
 
   <property>
     <name>dfs.data.dir</name>
-    <value>/mnt/ephemeral-hdfs/data,/mnt2/ephemeral-hdfs/data</value>
+    <value>/mnt/ephemeral-hdfs/data,/mnt2/ephemeral-hdfs/data,/mnt3/ephemeral-hdfs/data,/mnt4/ephemeral-hdfs/data</value>
   </property>
 
   <property>
