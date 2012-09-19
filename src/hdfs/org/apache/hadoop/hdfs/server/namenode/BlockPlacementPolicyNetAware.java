@@ -342,7 +342,7 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
       clusterMap.countNumOfAvailableNodes(nodes, excludedNodes.keySet());
     while(numOfAvailableNodes > 0) {
       DatanodeDescriptor chosenNode = 
-        pickMinLoadedNode(clusterMap.getAvailableLeaves(nodes, excludedNodes.keySet()), localMachine);
+        pickMinLoadedNode(clusterMap.getAvailableLeaves(nodes, excludedNodes.keySet()), localMachine, blocksize);
 
       Node oldNode = excludedNodes.put(chosenNode, chosenNode);
       if (oldNode == null) { // chosenNode was not in the excluded list
@@ -372,7 +372,7 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     int numAttempts = numOfAvailableNodes * this.attemptMultiplier;
     while(numOfReplicas > 0 && numOfAvailableNodes > 0 && --numAttempts > 0) {
       DatanodeDescriptor chosenNode = 
-        pickMinLoadedNode(clusterMap.getAvailableLeaves(nodes, excludedNodes.keySet()), localMachine);
+        pickMinLoadedNode(clusterMap.getAvailableLeaves(nodes, excludedNodes.keySet()), localMachine, blocksize);
       Node oldNode = excludedNodes.put(chosenNode, chosenNode);
       if (oldNode == null) {
         numOfAvailableNodes--;
@@ -392,19 +392,26 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
    * @param candidates 
    * @return
    */
-  private DatanodeDescriptor pickMinLoadedNode(Collection<Node> candidates, DatanodeDescriptor localMachine) {
+  private DatanodeDescriptor pickMinLoadedNode(
+                                            Collection<Node> candidates, 
+                                            DatanodeDescriptor localMachine, 
+                                            long blocksize) {
     double minRxBps = Double.MAX_VALUE;
     Node retVal = null;
     
     // Cap at source's txBps
-    double maxRxBps = dnNameToTxBpsMap.get(localMachine.getName());
+    // double maxRxBps = dnNameToTxBpsMap.get(localMachine.getName());
     
     for (Node cand: candidates) {
       Double candRxBps = dnNameToRxBpsMap.get(cand.getName());
       if (candRxBps == null) {
         candRxBps = Double.MAX_VALUE;
       }
-      if (candRxBps <= minRxBps && (retVal == null || candRxBps >= maxRxBps)) {
+      if (candRxBps <= minRxBps 
+          && isGoodTarget(localMachine, blocksize)
+          // && (retVal == null || candRxBps >= maxRxBps)
+          ) {
+        
         retVal = cand;
         minRxBps = candRxBps;
       }
@@ -416,6 +423,30 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     return (DatanodeDescriptor) retVal;
   }
   
+  /* judge if a node is a good target.
+   * return true if <i>node</i> has enough space
+   */
+  protected boolean isGoodTarget(
+                               DatanodeDescriptor node,
+                               long blockSize) {
+    
+    Log logr = FSNamesystem.LOG;
+    long remaining = node.getRemaining() - 
+                     (node.getBlocksScheduled() * blockSize); 
+    // check the remaining capacity of the target machine
+    if (blockSize* FSConstants.MIN_BLOCKS_FOR_WRITE>remaining) {
+      if (logr.isDebugEnabled()) {
+        logr.debug("Node "+ NodeBase.getPath(node) +
+                " is not chosen because the node does not have enough space" +
+                " for block size " + blockSize +
+                " with Remaining = " + node.getRemaining() + 
+                " and Scheduled = " + node.getBlocksScheduled());
+      }
+      return false;
+    }
+    return true;
+  }
+
   /* Return a pipeline of nodes.
    * The pipeline is formed finding a shortest path that 
    * starts from the writer and traverses all <i>nodes</i>
