@@ -23,7 +23,6 @@ import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
-import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.net.DNSToSwitchMapping;
 import org.apache.hadoop.net.NetworkTopology;
 import org.apache.hadoop.net.Node;
@@ -152,8 +151,7 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
     // Update network usage of the selected ones 
     for (DatanodeDescriptor dd: selectedOnes) {
       // Bump up the RxBps based on blocksize
-      LOG.info("chooseTarget selected " + dd.getName()
-          + " with RxBps = " + (dnNameToRxBpsMap.containsKey(dd.getName()) ? dnNameToRxBpsMap.get(dd.getName()) : 0.0));
+      LOG.info("chooseTarget selected " + dd.getName() + " with RxBps = " + getDnRxBps(dd.getName()));
       adjustRxBps(dd.getName(), blocksize);
     }
     

@@ -20,7 +20,6 @@ package org.apache.hadoop.hdfs.server.namenode;
 import org.apache.commons.logging.*;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.protocol.Block;
-import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.net.DNSToSwitchMapping;
 import org.apache.hadoop.net.NetworkTopology;
@@ -36,10 +35,60 @@ import java.util.*;
  */
 public abstract class BlockPlacementPolicy {
   
+  // Keep track of the Configuration
+  static Configuration confCopy = null;
+  
+  private class BpsInfo {
+    double bps = 0.0;
+    double tempBps = 0.0;
+    boolean isTemp = false;
+    long lastUpdateTime = now();
+    
+    void resetToNormal(double bps) {
+      this.bps = bps;
+      this.tempBps = bps;
+      this.isTemp = false;
+      this.lastUpdateTime = now();
+    }
+    
+    void moveToTemp(double blockSize) {
+      // Into the temporary zone
+      this.isTemp = true;
+
+      // 1Gbps == 128MBps
+      double nicSpeed = 128.0 * 1024 * 1024;
+      
+      // Aim to increase by the remaining capacity of the link
+      double incVal = nicSpeed - this.tempBps;
+      if (incVal < 0.0) {
+        incVal = 0.0;
+      }
+      
+      // Calculate the expected time till the next update
+      double secElapsed = (now() - lastUpdateTime) / 1000.0;
+      double timeTillUpdate = 1.0 * confCopy.getInt("dfs.heartbeat.interval", 1) - secElapsed;
+
+      // Bound incVal by blockSize
+      if (timeTillUpdate > 0.0) {
+        double temp = blockSize / timeTillUpdate;
+        if (temp < incVal) {
+          incVal = temp;
+        }
+      }
+      
+      this.tempBps = this.tempBps + incVal;
+    }
+    
+    private long now() {
+      return System.currentTimeMillis();
+    }
+  }
+  
   public static final Log LOG = LogFactory.getLog(BlockPlacementPolicy.class.getName());
+  
   // Keep track of receiving throughput at each DataNode
-  public Map<String, Double> dnNameToRxBpsMap = Collections.synchronizedMap(new HashMap<String, Double>());
-  public Map<String, Double> dnNameToTxBpsMap = Collections.synchronizedMap(new HashMap<String, Double>());
+  private Map<String, BpsInfo> dnNameToRxBpsMap = Collections.synchronizedMap(new HashMap<String, BpsInfo>());
+  // private Map<String, Double> dnNameToTxBpsMap = Collections.synchronizedMap(new HashMap<String, Double>());
   
   public double oldFactor = 0.0;
 
@@ -189,6 +238,9 @@ public abstract class BlockPlacementPolicy {
                                                  HostsFileReader hostsReader,
                                                  DNSToSwitchMapping dnsToSwitchMapping,
                                                  FSNamesystem namesystem) {
+    // Store the configuration
+    BlockPlacementPolicy.confCopy = conf;
+    
     Class<? extends BlockPlacementPolicy> replicatorClass =
                       conf.getClass("dfs.block.replicator.classname",
                                     BlockPlacementPolicyDefault.class,
@@ -229,21 +281,26 @@ public abstract class BlockPlacementPolicy {
    * @param txBps transmitting throughput of the DataNode
    */
   public void updateNetworkInformation(String dnName, double newRxBps, double newTxBps) {
-    double oldRxBps = (dnNameToRxBpsMap.containsKey(dnName)) ? dnNameToRxBpsMap.get(dnName) : 0.0;
-    double rxBps = (1.0 - this.oldFactor) * newRxBps + this.oldFactor * oldRxBps;
-    dnNameToRxBpsMap.put(dnName, rxBps);
-    double oldTxBps = (dnNameToTxBpsMap.containsKey(dnName)) ? dnNameToTxBpsMap.get(dnName) : 0.0;
-    double txBps = (1.0 - this.oldFactor) * newTxBps + this.oldFactor * oldTxBps;
-    dnNameToTxBpsMap.put(dnName, txBps);
+    BpsInfo bpsInfo = (dnNameToRxBpsMap.containsKey(dnName)) ? dnNameToRxBpsMap.get(dnName) : new BpsInfo();
+    double rxBps = (1.0 - this.oldFactor) * newRxBps + this.oldFactor * bpsInfo.bps;
+    bpsInfo.resetToNormal(rxBps);
+    dnNameToRxBpsMap.put(dnName, bpsInfo);
+
+    // double oldTxBps = (dnNameToTxBpsMap.containsKey(dnName)) ? dnNameToTxBpsMap.get(dnName) : 0.0;
+    // double txBps = (1.0 - this.oldFactor) * newTxBps + this.oldFactor * oldTxBps;
+    // dnNameToTxBpsMap.put(dnName, txBps);
 
     // LOG.info(dnName + ": updatedRxBps = " + rxBps + " oldRxBps = " + oldRxBps + " oldFactor = " + this.oldFactor);
 }
   
-  public void adjustRxBps(String dnName, double blocksize) {
-    double oldRxBps = (dnNameToRxBpsMap.containsKey(dnName)) ? dnNameToRxBpsMap.get(dnName) : 0.0;
-    double toAdd = blocksize * 0.5; // Default blocksize is 256MB
-    double newRxBps = oldRxBps + toAdd;
-    double nicSpeed = 128.0 * 1024 * 1024;  // 1Gbps == 128MBps 
-    dnNameToRxBpsMap.put(dnName, (newRxBps > nicSpeed) ? nicSpeed : newRxBps);
+  public void adjustRxBps(String dnName, double blockSize) {
+    BpsInfo bpsInfo = (dnNameToRxBpsMap.containsKey(dnName)) ? dnNameToRxBpsMap.get(dnName) : new BpsInfo();
+    bpsInfo.moveToTemp(blockSize);
+    dnNameToRxBpsMap.put(dnName, bpsInfo);
+  }
+  
+  public double getDnRxBps(String dnName) {
+    BpsInfo bpsInfo = dnNameToRxBpsMap.containsKey(dnName) ? dnNameToRxBpsMap.get(dnName) : new BpsInfo();
+    return bpsInfo.isTemp ? bpsInfo.tempBps : bpsInfo.bps;
   }
 }
