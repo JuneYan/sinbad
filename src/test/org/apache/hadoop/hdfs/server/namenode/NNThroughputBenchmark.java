@@ -34,6 +34,7 @@ import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.BlockListAsLongs;
+import org.apache.hadoop.hdfs.protocol.DataTransferProtocol;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
@@ -695,7 +696,7 @@ public class NNThroughputBenchmark {
      * Host names are all the same, the ordering goes by port numbers.
      */
     private static String getNodeName(int port) throws IOException {
-      String machineName = DNS.getDefaultHost("default", "default");
+      String machineName = DNS.getDefaultIP("default");
       String sPort = String.valueOf(100000 + port);
       if(sPort.length() > 6)
         throw new IOException("Too many data-nodes.");
@@ -715,11 +716,12 @@ public class NNThroughputBenchmark {
     void register() throws IOException {
       // get versions from the namenode
       nsInfo = nameNode.versionRequest();
-      dnRegistration.setStorageInfo(new DataStorage(nsInfo, ""), "");
+      dnRegistration.setStorageInfo(new DataStorage(nsInfo, "", null), "");
       String storageId = DataNode.createNewStorageId(dnRegistration.getPort());
       dnRegistration.setStorageID(storageId);
       // register datanode
-      dnRegistration = nameNode.register(dnRegistration);
+      dnRegistration = nameNode.register(dnRegistration,
+          DataTransferProtocol.DATA_TRANSFER_VERSION);
     }
 
     /**
@@ -729,7 +731,7 @@ public class NNThroughputBenchmark {
     void sendHeartbeat() throws IOException {
       // register datanode
       DatanodeCommand[] cmds = nameNode.sendHeartbeat(
-          dnRegistration, DF_CAPACITY, DF_USED, DF_CAPACITY - DF_USED, DF_USED, 0, 0);
+          dnRegistration, DF_CAPACITY, DF_USED, DF_CAPACITY - DF_USED, DF_USED, 0, 0, 0.0, 0.0);
       if(cmds != null) {
         for (DatanodeCommand cmd : cmds ) {
           LOG.debug("sendHeartbeat Name-node reply: " + cmd.getAction());
@@ -763,7 +765,7 @@ public class NNThroughputBenchmark {
     int replicateBlocks() throws IOException {
       // register datanode
       DatanodeCommand[] cmds = nameNode.sendHeartbeat(
-          dnRegistration, DF_CAPACITY, DF_USED, DF_CAPACITY - DF_USED, DF_USED, 0, 0);
+          dnRegistration, DF_CAPACITY, DF_USED, DF_CAPACITY - DF_USED, DF_USED, 0, 0, 0.0, 0.0);
       if (cmds != null) {
         for (DatanodeCommand cmd : cmds) {
           if (cmd.getAction() == DatanodeProtocol.DNA_TRANSFER) {
@@ -791,7 +793,7 @@ public class NNThroughputBenchmark {
           DatanodeRegistration receivedDNReg;
           receivedDNReg = new DatanodeRegistration(dnInfo.getName());
           receivedDNReg.setStorageInfo(
-                          new DataStorage(nsInfo, dnInfo.getStorageID()),
+              new DataStorage(nsInfo, dnInfo.getStorageID(), null),
                           dnInfo.getStorageID());
           receivedDNReg.setInfoPort(dnInfo.getInfoPort());
           Block[] bi = new Block[] {blocks[i]};

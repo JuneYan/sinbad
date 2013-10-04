@@ -45,7 +45,7 @@ public class TestDatanodeDeath extends TestCase {
     ((Log4JLogger)NameNode.stateChangeLog).getLogger().setLevel(Level.ALL);
     ((Log4JLogger)LeaseManager.LOG).getLogger().setLevel(Level.ALL);
     ((Log4JLogger)FSNamesystem.LOG).getLogger().setLevel(Level.ALL);
-    ((Log4JLogger)DataNode.LOG).getLogger().setLevel(Level.ALL);
+    DataNode.LOG.getLogger().setLevel(Level.ALL);
     ((Log4JLogger)DFSClient.LOG).getLogger().setLevel(Level.ALL);
     ((Log4JLogger)InterDatanodeProtocol.LOG).getLogger().setLevel(Level.ALL);
   }
@@ -89,8 +89,7 @@ public class TestDatanodeDeath extends TestCase {
         try {
           System.out.println("Workload processing file " + filename);
           FSDataOutputStream stm = createFile(fs, filename, replication);
-          DFSClient.DFSOutputStream dfstream = (DFSClient.DFSOutputStream)
-                                                 (stm.getWrappedStream());
+          DFSOutputStream dfstream = (DFSOutputStream)(stm.getWrappedStream());
           dfstream.setArtificialSlowdown(1000);
           writeFile(stm, myseed);
           stm.close();
@@ -357,8 +356,7 @@ public class TestDatanodeDeath extends TestCase {
       // create a file and write one block of data
       System.out.println("SimpleTest creating file " + filename);
       FSDataOutputStream stm = createFile(fs, filename, repl);
-      DFSClient.DFSOutputStream dfstream = (DFSClient.DFSOutputStream)
-                                             (stm.getWrappedStream());
+      DFSOutputStream dfstream = (DFSOutputStream)(stm.getWrappedStream());
 
       // these are test settings
       dfstream.setChunksPerPacket(5);

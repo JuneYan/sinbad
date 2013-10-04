@@ -20,8 +20,13 @@ package org.apache.hadoop.hdfs.protocol;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 
+import com.facebook.swift.codec.ThriftConstructor;
+import com.facebook.swift.codec.ThriftField;
+import com.facebook.swift.codec.ThriftStruct;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.io.WritableFactories;
@@ -37,6 +42,7 @@ import org.apache.hadoop.util.StringUtils;
  * This object is used for communication in the
  * Datanode Protocol and the Client Protocol.
  */
+@ThriftStruct
 public class DatanodeInfo extends DatanodeID implements Node {
   protected long capacity;
   protected long dfsUsed;
@@ -45,12 +51,44 @@ public class DatanodeInfo extends DatanodeID implements Node {
   protected long lastUpdate;
   protected int xceiverCount;
   protected String location = NetworkTopology.DEFAULT_RACK;
+  private static volatile boolean suspectNodes = true;
 
   /** HostName as suplied by the datanode during registration as its 
    * name. Namenode uses datanode IP address as the name.
    */
   protected String hostName = null;
-  
+
+  public static void write(DataOutput out, DatanodeInfo elem) throws IOException {
+    DatanodeInfo node = new DatanodeInfo(elem);
+    node.write(out);
+  }
+
+  public static DatanodeInfo read(DataInput in) throws IOException {
+    DatanodeInfo node = new DatanodeInfo();
+    node.readFields(in);
+    return node;
+  }
+
+  public static void writeList(DataOutput out, List<DatanodeInfo> list) throws IOException {
+    if (list != null) {
+      out.writeInt(list.size());
+      for (DatanodeInfo elem : list) {
+        DatanodeInfo.write(out, elem);
+      }
+    } else {
+      out.writeInt(-1);
+    }
+  }
+
+  public static List<DatanodeInfo> readList(DataInput in) throws IOException {
+    final int listSize = in.readInt();
+    List<DatanodeInfo> list = (listSize < 0) ? null : new ArrayList<DatanodeInfo>(listSize);
+    for (int i = 0; i < listSize; i++) {
+      list.add(DatanodeInfo.read(in));
+    }
+    return list;
+  }
+
   // administrative states of a datanode
   public enum AdminStates {
     NORMAL("In Service"), 
@@ -69,6 +107,8 @@ public class DatanodeInfo extends DatanodeID implements Node {
   }
   
   protected AdminStates adminState;
+  protected boolean suspectFail = false;
+  
 
 
   public DatanodeInfo() {
@@ -87,6 +127,7 @@ public class DatanodeInfo extends DatanodeID implements Node {
     this.location = from.getNetworkLocation();
     this.adminState = from.adminState;
     this.hostName = from.hostName;
+    this.suspectFail = from.suspectFail;
   }
 
   public DatanodeInfo(DatanodeID nodeID) {
@@ -99,17 +140,52 @@ public class DatanodeInfo extends DatanodeID implements Node {
     this.xceiverCount = 0;
     this.adminState = null;    
   }
-  
+
+  @ThriftConstructor
+  // Last ThriftField used in superclass: 4
+  public DatanodeInfo(@ThriftField(1) String name, @ThriftField(2) String storageID,
+      @ThriftField(3) int infoPort, @ThriftField(4) int ipcPort, @ThriftField(6) long capacity,
+      @ThriftField(7) long dfsUsed, @ThriftField(8) long remaining,
+      @ThriftField(9) long namespaceUsed, @ThriftField(10) long lastUpdate,
+      @ThriftField(11) int xceiverCount, @ThriftField(12) String networkLocation,
+      @ThriftField(13) String hostName, @ThriftField(14) int adminStateOrdinal) {
+    super(name, storageID, infoPort, ipcPort);
+    this.capacity = capacity;
+    this.dfsUsed = dfsUsed;
+    this.remaining = remaining;
+    this.namespaceUsed = namespaceUsed;
+    this.lastUpdate = lastUpdate;
+    this.xceiverCount = xceiverCount;
+    this.location = networkLocation;
+    this.hostName = hostName;
+    setAdminState(AdminStates.values()[adminStateOrdinal]);
+  }
+
   protected DatanodeInfo(DatanodeID nodeID, String location, String hostName) {
     this(nodeID);
     this.location = location;
     this.hostName = hostName;
   }
-  
+
+  @ThriftField(5)
+  public DatanodeID getDatanodeID() {
+    return new DatanodeID(this);
+  }
+
+  public boolean isSuspectFail() {
+    return suspectFail;
+  }
+
+  public void setSuspectFail(boolean suspectFail) {
+    this.suspectFail = suspectFail;
+  }
+
   /** The raw capacity. */
+  @ThriftField(6)
   public long getCapacity() { return capacity; }
   
   /** The used space by the data node. */
+  @ThriftField(7)
   public long getDfsUsed() { return dfsUsed; }
 
   /** The used space by the data node. */
@@ -126,7 +202,8 @@ public class DatanodeInfo extends DatanodeID implements Node {
 
     return ((float)dfsUsed * 100.0f)/(float)capacity; 
   }
-  
+
+  @ThriftField(9)
   public long getNamespaceUsed() { return namespaceUsed; }
   
   /** The used space by the data node as percentage of present capacity */
@@ -139,6 +216,7 @@ public class DatanodeInfo extends DatanodeID implements Node {
   }
 
   /** The raw free space. */
+  @ThriftField(8)
   public long getRemaining() { return remaining; }
 
   /** The remaining space as percentage of configured capacity. */
@@ -151,9 +229,11 @@ public class DatanodeInfo extends DatanodeID implements Node {
   }
 
   /** The time when this information was accurate. */
+  @ThriftField(10)
   public long getLastUpdate() { return lastUpdate; }
 
   /** number of active connections */
+  @ThriftField(11)
   public int getXceiverCount() { return xceiverCount; }
 
   /** Sets raw capacity. */
@@ -177,6 +257,7 @@ public class DatanodeInfo extends DatanodeID implements Node {
   }
 
   /** rack name **/
+  @ThriftField(12)
   public synchronized String getNetworkLocation() {return location;}
     
   /** Sets the rack name */
@@ -184,10 +265,16 @@ public class DatanodeInfo extends DatanodeID implements Node {
     this.location = NodeBase.normalize(location);
   }
   
+  @Deprecated
   public String getHostName() {
     return (hostName == null || hostName.length()==0) ? getHost() : hostName;
   }
-  
+
+  @ThriftField(value = 13, name = "hostName")
+  public String getTHostName() {
+    return hostName;
+  }
+
   public void setHostName(String host) {
     hostName = host;
   }
@@ -302,6 +389,11 @@ public class DatanodeInfo extends DatanodeID implements Node {
     return adminState;
   }
 
+  @ThriftField(14)
+  public int getAdminStateOrdinal() {
+    return getAdminState().ordinal();
+  }
+
   /**
    * Sets the admin state of this node.
    */
@@ -350,8 +442,8 @@ public class DatanodeInfo extends DatanodeID implements Node {
     out.writeLong(remaining);
     out.writeLong(lastUpdate);
     out.writeInt(xceiverCount);
-    Text.writeString(out, location);
-    Text.writeString(out, hostName == null? "": hostName);
+    Text.writeStringOpt(out, location);
+    Text.writeStringOpt(out, hostName == null? "": hostName);
     WritableUtils.writeEnum(out, getAdminState());
   }
 
@@ -367,8 +459,20 @@ public class DatanodeInfo extends DatanodeID implements Node {
     this.remaining = in.readLong();
     this.lastUpdate = in.readLong();
     this.xceiverCount = in.readInt();
-    this.location = Text.readString(in);
-    this.hostName = Text.readString(in);
+    this.location = Text.readStringOpt(in);
+    this.hostName = Text.readStringOpt(in);
     setAdminState(WritableUtils.readEnum(in, AdminStates.class));
+  }
+
+  public static boolean shouldSuspectNodes() {
+    return suspectNodes;
+  }
+
+  public static void enableSuspectNodes() {
+    DatanodeInfo.suspectNodes = true;
+  }
+  
+  public static void disableSuspectNodes() {
+    DatanodeInfo.suspectNodes = false;
   }
 }

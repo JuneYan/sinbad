@@ -3,15 +3,21 @@ package org.apache.hadoop.corona;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
 
 import junit.framework.TestCase;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.mapred.JobConf;
+import org.apache.hadoop.mapred.ResourceTracker;
 import org.apache.hadoop.mapred.UtilsForTests;
+import org.apache.hadoop.mapred.CoronaJobTracker;
 
 public class TestSessionDriver extends TestCase {
   final static Log LOG = LogFactory.getLog(TestSessionDriver.class);
@@ -24,10 +30,14 @@ public class TestSessionDriver extends TestCase {
   SessionDriver driver;
   UtilsForTests.FakeClock myclock;
 
-  class ResourceDriver implements SessionDriverService.Iface {
+  //class ResourceDriver implements SessionDriverService.Iface {
+  class ResourceDriver extends CoronaJobTracker {
     public List<ResourceGrant> granted = new ArrayList<ResourceGrant> ();
     public List<ResourceGrant> revoked = new ArrayList<ResourceGrant> ();
 
+    public ResourceDriver() throws IOException{
+      super(new JobConf());
+    }
     @Override
     public void grantResource(String handle, List<ResourceGrant> granted) {
       LOG.info("Received " + granted.size() + " grants for session: " + handle);
@@ -38,6 +48,10 @@ public class TestSessionDriver extends TestCase {
     public void revokeResource(String handle,
                                List<ResourceGrant> revoked, boolean force) {
       this.revoked.addAll(revoked);
+    }
+
+    @Override
+    public void processDeadNode(String handle, String deadNode) {
     }
   }
 
@@ -62,12 +76,17 @@ public class TestSessionDriver extends TestCase {
 
     ClusterNodeInfo nodes [];
     nodes = new ClusterNodeInfo[numNodes];
+    Map<ResourceType, String> resourceInfos =
+        new EnumMap<ResourceType, String>(ResourceType.class);
+    resourceInfos.put(ResourceType.MAP, "");
+    resourceInfos.put(ResourceType.REDUCE, "");
     for (int i=0; i<numNodes; i++) {
       nodes[i] = new ClusterNodeInfo(TstUtils.getNodeHost(i),
                                      new InetAddress(TstUtils.getNodeHost(i),
                                                      TstUtils.getNodePort(i)),
                                      TstUtils.std_spec);
-      nodes[i].setUsed(TstUtils.free_spec);
+      nodes[i].setFree(TstUtils.std_spec);
+      nodes[i].setResourceInfos(resourceInfos);
     }
     for (int i=0; i<numNodes; i++) {
       cm.nodeHeartbeat(nodes[i]);
@@ -75,6 +94,7 @@ public class TestSessionDriver extends TestCase {
 
     rd = new ResourceDriver();
     driver = new SessionDriver(conf, rd);
+    driver.startSession();
   }
 
   protected void tearDown() throws InterruptedException {
@@ -96,7 +116,7 @@ public class TestSessionDriver extends TestCase {
       LOG.info("Starting testRoundTrip");
 
       driver.requestResources(TstUtils.createRequests(100, this.numNodes));
-      TestClusterManager.reliableSleep(100);
+      TestClusterManager.reliableSleep(1000);
 
       assertEquals(rd.granted.size(), 100);
 
@@ -111,6 +131,7 @@ public class TestSessionDriver extends TestCase {
       assertEquals(idSet.size(), 0);
     } catch (Throwable t) {
       t.printStackTrace();
+      throw t;
     }
   }
 
@@ -124,11 +145,12 @@ public class TestSessionDriver extends TestCase {
       conf.setInt(CoronaConf.CM_SOTIMEOUT, 100);
       ResourceDriver rd2 = new ResourceDriver();
       SessionDriver driver2 = new SessionDriver(conf, rd2);
+      driver2.startSession();
 
       // session #1 requests all the resources
       List<ResourceRequest> d1rq = TstUtils.createRequests(800, this.numNodes);
       driver.requestResources(d1rq);
-      TestClusterManager.reliableSleep(100);
+      TestClusterManager.reliableSleep(1000);
 
       // session #2 requests all the resources as well
       driver2.requestResources(TstUtils.createRequests(800, this.numNodes));
@@ -158,7 +180,7 @@ public class TestSessionDriver extends TestCase {
       synchronized(retiredSessions) {
         assertEquals(retiredSessions.size(), 1);
         for (RetiredSession s: retiredSessions)
-          assertEquals(s.status, SessionStatus.TIMED_OUT);
+          assertEquals(s.getStatus(), SessionStatus.TIMED_OUT);
       }
 
     } catch (Throwable t) {
@@ -182,6 +204,7 @@ public class TestSessionDriver extends TestCase {
       // new session driver
       rd = new ResourceDriver();
       driver = new SessionDriver(conf, rd);
+      driver.startSession();
 
       // shutdown the clustermanager server. the CM should still be running
       // but will be inaccessible for sometime.
@@ -205,10 +228,10 @@ public class TestSessionDriver extends TestCase {
 
       driver.requestResources(rlist.subList(600, 800));
 
-      TestClusterManager.reliableSleep(300);
+      TestClusterManager.reliableSleep(1000);
 
       // at this time session #1 should have all the resources. release them
-      assertEquals(rd.granted.size(), 800);
+      assertEquals(800, rd.granted.size());
 
       LOG.info("Stopping testCMFailureTransient");
     } catch (Throwable t) {
@@ -225,14 +248,18 @@ public class TestSessionDriver extends TestCase {
       cms.stopRunning();
       cms.interrupt();
       cms.join();
-
+      
       List<ResourceRequest> rlist = TstUtils.createRequests(this.numNodes, 800, 0);
 
       // requests some resources
-      driver.requestResources(rlist.subList(0, 400));
+      try {
+        driver.requestResources(rlist.subList(0, 400));
+      } catch (IOException e) {
+        
+      }
 
       // these requests will timeout immediately
-      TestClusterManager.reliableSleep(100);
+      TestClusterManager.reliableSleep(20000);
 
       if (driver.getFailed() == null)
         assertEquals("CM failure not detected", null);

@@ -19,9 +19,12 @@ package org.apache.hadoop.hdfs.protocol;
 
 import java.io.*;
 
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.OpenFileInfo;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.protocol.FSConstants.UpgradeAction;
 import org.apache.hadoop.hdfs.server.namenode.DatanodeDescriptor;
+import org.apache.hadoop.hdfs.server.protocol.BlockSynchronizationProtocol;
 import org.apache.hadoop.hdfs.server.common.UpgradeStatusReport;
 import org.apache.hadoop.ipc.VersionedProtocol;
 import org.apache.hadoop.security.AccessControlException;
@@ -35,7 +38,8 @@ import org.apache.hadoop.fs.FileStatus;
  * as well as open/close file streams, etc.
  *
  **********************************************************************/
-public interface ClientProtocol extends VersionedProtocol {
+public interface ClientProtocol extends VersionedProtocol,
+    BlockSynchronizationProtocol {
 
   public static final long OPTIMIZE_FILE_STATUS_VERSION = 42L;
   public static final long ITERATIVE_LISTING_VERSION = 43L;
@@ -193,6 +197,23 @@ public interface ClientProtocol extends VersionedProtocol {
    * @throws IOException if other errors occur.
    */
   public LocatedBlockWithMetaInfo appendAndFetchMetaInfo(String src, String clientName) throws IOException;
+  
+  /**
+   * Append to the end of the file. 
+   * @param src path of the file being created.
+   * @param clientName name of the current client.
+   * @return information about the last partial block if any.
+   * @throws AccessControlException if permission to append file is 
+   * denied by the system. As usually on the client side the exception will 
+   * be wrapped into {@link org.apache.hadoop.ipc.RemoteException}.
+   * Allows appending to an existing file if the server is
+   * configured with the parameter dfs.support.append set to true, otherwise
+   * Return the LocatedBlock with namespace id and old generation stamp.
+   * 
+   * throws an IOException.
+   * @throws IOException if other errors occur.
+   */
+  public LocatedBlockWithOldGS appendAndFetchOldGS(String src, String clientName) throws IOException;
   
   /**
    * Start lease recovery
@@ -413,11 +434,38 @@ public interface ClientProtocol extends VersionedProtocol {
    *          a list of nodes that should not be allocated
    * @param favoredNodes
    *          a list of nodes that should be favored for allocation
+   * @param startPos
+   *          expected starting position of the next block
    * @return LocatedBlock allocated block information.
    */
   public LocatedBlockWithMetaInfo addBlockAndFetchMetaInfo(
       String src, String clientName, DatanodeInfo[] excludedNodes,
       DatanodeInfo[] favoredNodes, long startPos)
+      throws IOException;
+
+  /**
+   * A client that wants to write an additional block to the indicated filename
+   * (which must currently be open for writing) should call addBlock().
+   * 
+   * addBlock() allocates a new block and datanodes the block data should be
+   * replicated to. It will double check the supposed starting pos and fail
+   * the request if it doesn't match. In the case that the last block
+   * is the second last one, and the last one is empty, the name-node assumes
+   * that it is the duplicated call, so it will return the last empty block.
+   * 
+   * @param excludedNodes
+   *          a list of nodes that should not be allocated
+   * @param favoredNodes
+   *          a list of nodes that should be favored for allocation
+   * @param startPos
+   *          expected starting position of the next block
+   * @param lastBlock
+   *          metadata for last block of the file which the client knows.
+   * @return LocatedBlock allocated block information.
+   */
+  public LocatedBlockWithMetaInfo addBlockAndFetchMetaInfo(
+      String src, String clientName, DatanodeInfo[] excludedNodes,
+      DatanodeInfo[] favoredNodes, long startPos, Block lastBlock)
       throws IOException;
   
   /**
@@ -452,6 +500,28 @@ public interface ClientProtocol extends VersionedProtocol {
       throws IOException;
   
   /**
+   * The client is done writing data to the given filename, and would 
+   * like to complete it. The file length is also attached so that
+   * name-node can confirm that name-node has records of all the
+   * blocks
+   *
+   * The function returns whether the file has been closed successfully.
+   * If the function returns false, the caller should try again.
+   *
+   * A call to complete() will not return true until all the file's
+   * blocks have been replicated the minimum number of times.  Thus,
+   * DataNode failures may cause a client to call complete() several
+   * times before succeeding.
+   * 
+   * Client sends the last block of the file to the name-node. For a
+   * closed file, name-node will double check file length, last block
+   * ID. If both matches, name-node will simply make sure edit log
+   * has been written and return success.
+   */
+  public boolean complete(String src, String clientName, long fileLen,
+      Block lastBlock) throws IOException;
+  
+  /**
    * The client wants to report corrupted blocks (blocks with specified
    * locations on datanodes).
    * @param blocks Array of located blocks to report
@@ -461,6 +531,33 @@ public interface ClientProtocol extends VersionedProtocol {
   ///////////////////////////////////////
   // Namespace management
   ///////////////////////////////////////
+  
+  /** 
+   * Hard link the dst file to the src file 
+   *  
+   * @param src the src file  
+   * @param dst the dst file  
+   * @return true if successful, or false if the src file does not exists, or the src is a directory
+   * or the dst file has already exited, or dst file's parent directory does not exist  
+   * @throws IOException if the new name is invalid.  
+   * @throws QuotaExceededException if the hardlink would violate   
+   *                                any quota restriction 
+   */
+  public boolean hardLink(String src, String dst) throws IOException;
+
+  /**
+   * Computes the list of files hardlinked to the given file
+   *
+   * @param src
+   *          the file to look for
+   * @return a list of files that are hardlinked to the given file, return an
+   *         empty list if no files are found or the file has a reference count
+   *         of 1
+   * @throws IOException
+   *           if the given name is invalid
+   */
+  public String[] getHardLinkedFiles(String src) throws IOException;
+
   /**
    * Rename an item in the file system namespace.
    * 
@@ -497,6 +594,17 @@ public interface ClientProtocol extends VersionedProtocol {
    *                                any quota restriction
    */
   public void concat(String trg, String [] srcs, boolean restricted) throws IOException;
+  
+  /**
+   * Merge parity file and source file into one Raided file 
+   * @param parity - parity file
+   * @param source - source file
+   * @param codecId - the codec id of raid codec
+   * @param checksums - list of checksums of source blocks 
+   * @throws IOException
+   */
+  public void merge(String parity, String source, String codecId, 
+      int[] checksums) throws IOException;
 
   /**
    * Delete the given file or directory from the file system.
@@ -536,6 +644,18 @@ public interface ClientProtocol extends VersionedProtocol {
    *                                any quota restriction.
    */
   public boolean mkdirs(String src, FsPermission masked) throws IOException;
+
+  /**
+   * Fetch the list of files that have been open longer than a
+   * specified amount of time.
+   * @param prefix path prefix specifying subset of files to examine
+   * @param millis select files that have been open longer that this
+   * @param start where to start searching, or null
+   * @return array of OpenFileInfo objects
+   * @throw IOException
+   */
+  public OpenFileInfo[] iterativeGetOpenFiles(
+    String prefix, int millis, String start) throws IOException;
 
   /**
    * Get a listing of the indicated directory
@@ -700,6 +820,12 @@ public interface ClientProtocol extends VersionedProtocol {
   public void saveNamespace() throws IOException;
   
   /**
+   * Roll edit log manually.
+   * @throws IOException if the roll failed.
+   */
+  public void rollEditLogAdmin() throws IOException;
+  
+  /**
    * Save namespace image.
    * 
    * @param force not require safe mode if true
@@ -741,6 +867,11 @@ public interface ClientProtocol extends VersionedProtocol {
    * @throws IOException
    */
   public void metaSave(String filename) throws IOException;
+  
+  /**
+   * Enable/Disable Block Replication.
+   */
+  public void blockReplication(boolean isEnable) throws IOException;
 
   /**
    * @return Array of FileStatus objects referring to corrupted files.
@@ -824,6 +955,19 @@ public interface ClientProtocol extends VersionedProtocol {
    *              by this call.
    */
   public void setTimes(String src, long mtime, long atime) throws IOException;
+  
+  /**
+   * Update a pipeline for a block under construction
+   * 
+   * @param clientName   the name of the client
+   * @param oldBlock    the old block
+   * @param newBlock    the new block containing new generation stamp and length
+   * @param newNodes    datanodes in the pipeline
+   * @throws IOException  if any error happens
+   */
+  public void updatePipeline(String clientName, Block oldBlock, 
+        Block newBlock, DatanodeID[] newNodes) 
+      throws IOException;
 
   /**
    * Get the datanode's data transfer protocol version
@@ -831,4 +975,40 @@ public interface ClientProtocol extends VersionedProtocol {
    * @throws IOException
    */
   public int getDataTransferProtocolVersion() throws IOException;
+  
+  /**
+   * Get the name of the file the block belongs to and the locations
+   * of the block.
+   * 
+   * @param blockId
+   * @return
+   * @throws IOException
+   */
+  public LocatedBlockWithFileName getBlockInfo(long blockId) throws IOException;
+
+  /**
+   * Get cluster name of the name node
+   * 
+   * @return
+   * @throws IOException
+   */
+  public String getClusterName() throws IOException;
+  
+  /** Re-populate the namespace and diskspace count of every node with quota */
+  public void recount() throws IOException;
+  
+  /**
+   * Raid a file with given codec 
+   * No guarantee file will be raided when the call returns.
+   * Namenode will schedule raiding asynchronously. 
+   * If raiding is done when raidFile is called again, namenode will set 
+   * replication of source blocks to expectedSourceRepl 
+   * 
+   * @param source 
+   * @param codecId
+   * @param expectedSourceRepl 
+   * @throws IOException
+   */
+  public boolean raidFile(String source, String codecId, short expectedSourceRepl) 
+      throws IOException;
 }

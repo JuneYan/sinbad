@@ -27,16 +27,17 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
   private static final org.apache.thrift.protocol.TField NAME_FIELD_DESC = new org.apache.thrift.protocol.TField("name", org.apache.thrift.protocol.TType.STRING, (short)2);
   private static final org.apache.thrift.protocol.TField USER_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("userId", org.apache.thrift.protocol.TType.STRING, (short)3);
   private static final org.apache.thrift.protocol.TField GROUP_IDS_FIELD_DESC = new org.apache.thrift.protocol.TField("groupIds", org.apache.thrift.protocol.TType.LIST, (short)4);
-  private static final org.apache.thrift.protocol.TField POOL_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("poolId", org.apache.thrift.protocol.TType.STRING, (short)5);
+  private static final org.apache.thrift.protocol.TField POOL_INFO_STRINGS_FIELD_DESC = new org.apache.thrift.protocol.TField("poolInfoStrings", org.apache.thrift.protocol.TType.STRUCT, (short)5);
   private static final org.apache.thrift.protocol.TField PRIORITY_FIELD_DESC = new org.apache.thrift.protocol.TField("priority", org.apache.thrift.protocol.TType.I32, (short)6);
   private static final org.apache.thrift.protocol.TField NO_PREEMPT_FIELD_DESC = new org.apache.thrift.protocol.TField("noPreempt", org.apache.thrift.protocol.TType.BOOL, (short)7);
   private static final org.apache.thrift.protocol.TField URL_FIELD_DESC = new org.apache.thrift.protocol.TField("url", org.apache.thrift.protocol.TType.STRING, (short)8);
+  private static final org.apache.thrift.protocol.TField DEADLINE_FIELD_DESC = new org.apache.thrift.protocol.TField("deadline", org.apache.thrift.protocol.TType.I64, (short)9);
 
   public InetAddress address; // required
   public String name; // required
   public String userId; // required
   public List<String> groupIds; // required
-  public String poolId; // required
+  public PoolInfoStrings poolInfoStrings; // required
   /**
    * 
    * @see SessionPriority
@@ -44,6 +45,7 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
   public SessionPriority priority; // required
   public boolean noPreempt; // required
   public String url; // required
+  public long deadline; // required
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -51,14 +53,15 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
     NAME((short)2, "name"),
     USER_ID((short)3, "userId"),
     GROUP_IDS((short)4, "groupIds"),
-    POOL_ID((short)5, "poolId"),
+    POOL_INFO_STRINGS((short)5, "poolInfoStrings"),
     /**
      * 
      * @see SessionPriority
      */
     PRIORITY((short)6, "priority"),
     NO_PREEMPT((short)7, "noPreempt"),
-    URL((short)8, "url");
+    URL((short)8, "url"),
+    DEADLINE((short)9, "deadline");
 
     private static final Map<String, _Fields> byName = new HashMap<String, _Fields>();
 
@@ -81,14 +84,16 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
           return USER_ID;
         case 4: // GROUP_IDS
           return GROUP_IDS;
-        case 5: // POOL_ID
-          return POOL_ID;
+        case 5: // POOL_INFO_STRINGS
+          return POOL_INFO_STRINGS;
         case 6: // PRIORITY
           return PRIORITY;
         case 7: // NO_PREEMPT
           return NO_PREEMPT;
         case 8: // URL
           return URL;
+        case 9: // DEADLINE
+          return DEADLINE;
         default:
           return null;
       }
@@ -130,7 +135,8 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
 
   // isset id assignments
   private static final int __NOPREEMPT_ISSET_ID = 0;
-  private BitSet __isset_bit_vector = new BitSet(1);
+  private static final int __DEADLINE_ISSET_ID = 1;
+  private BitSet __isset_bit_vector = new BitSet(2);
 
   public static final Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
@@ -144,14 +150,16 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
     tmpMap.put(_Fields.GROUP_IDS, new org.apache.thrift.meta_data.FieldMetaData("groupIds", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
         new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST, 
             new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING))));
-    tmpMap.put(_Fields.POOL_ID, new org.apache.thrift.meta_data.FieldMetaData("poolId", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
-        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
+    tmpMap.put(_Fields.POOL_INFO_STRINGS, new org.apache.thrift.meta_data.FieldMetaData("poolInfoStrings", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
+        new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, PoolInfoStrings.class)));
     tmpMap.put(_Fields.PRIORITY, new org.apache.thrift.meta_data.FieldMetaData("priority", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
         new org.apache.thrift.meta_data.EnumMetaData(org.apache.thrift.protocol.TType.ENUM, SessionPriority.class)));
     tmpMap.put(_Fields.NO_PREEMPT, new org.apache.thrift.meta_data.FieldMetaData("noPreempt", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
     tmpMap.put(_Fields.URL, new org.apache.thrift.meta_data.FieldMetaData("url", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
+    tmpMap.put(_Fields.DEADLINE, new org.apache.thrift.meta_data.FieldMetaData("deadline", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
     metaDataMap = Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(SessionInfo.class, metaDataMap);
   }
@@ -192,8 +200,8 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
       }
       this.groupIds = __this__groupIds;
     }
-    if (other.isSetPoolId()) {
-      this.poolId = other.poolId;
+    if (other.isSetPoolInfoStrings()) {
+      this.poolInfoStrings = new PoolInfoStrings(other.poolInfoStrings);
     }
     if (other.isSetPriority()) {
       this.priority = other.priority;
@@ -202,6 +210,7 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
     if (other.isSetUrl()) {
       this.url = other.url;
     }
+    this.deadline = other.deadline;
   }
 
   public SessionInfo deepCopy() {
@@ -214,11 +223,13 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
     this.name = null;
     this.userId = null;
     this.groupIds = null;
-    this.poolId = null;
+    this.poolInfoStrings = null;
     this.priority = null;
     setNoPreemptIsSet(false);
     this.noPreempt = false;
     this.url = null;
+    setDeadlineIsSet(false);
+    this.deadline = 0;
   }
 
   public InetAddress getAddress() {
@@ -332,27 +343,27 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
     }
   }
 
-  public String getPoolId() {
-    return this.poolId;
+  public PoolInfoStrings getPoolInfoStrings() {
+    return this.poolInfoStrings;
   }
 
-  public SessionInfo setPoolId(String poolId) {
-    this.poolId = poolId;
+  public SessionInfo setPoolInfoStrings(PoolInfoStrings poolInfoStrings) {
+    this.poolInfoStrings = poolInfoStrings;
     return this;
   }
 
-  public void unsetPoolId() {
-    this.poolId = null;
+  public void unsetPoolInfoStrings() {
+    this.poolInfoStrings = null;
   }
 
-  /** Returns true if field poolId is set (has been assigned a value) and false otherwise */
-  public boolean isSetPoolId() {
-    return this.poolId != null;
+  /** Returns true if field poolInfoStrings is set (has been assigned a value) and false otherwise */
+  public boolean isSetPoolInfoStrings() {
+    return this.poolInfoStrings != null;
   }
 
-  public void setPoolIdIsSet(boolean value) {
+  public void setPoolInfoStringsIsSet(boolean value) {
     if (!value) {
-      this.poolId = null;
+      this.poolInfoStrings = null;
     }
   }
 
@@ -435,6 +446,29 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
     }
   }
 
+  public long getDeadline() {
+    return this.deadline;
+  }
+
+  public SessionInfo setDeadline(long deadline) {
+    this.deadline = deadline;
+    setDeadlineIsSet(true);
+    return this;
+  }
+
+  public void unsetDeadline() {
+    __isset_bit_vector.clear(__DEADLINE_ISSET_ID);
+  }
+
+  /** Returns true if field deadline is set (has been assigned a value) and false otherwise */
+  public boolean isSetDeadline() {
+    return __isset_bit_vector.get(__DEADLINE_ISSET_ID);
+  }
+
+  public void setDeadlineIsSet(boolean value) {
+    __isset_bit_vector.set(__DEADLINE_ISSET_ID, value);
+  }
+
   public void setFieldValue(_Fields field, Object value) {
     switch (field) {
     case ADDRESS:
@@ -469,11 +503,11 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
       }
       break;
 
-    case POOL_ID:
+    case POOL_INFO_STRINGS:
       if (value == null) {
-        unsetPoolId();
+        unsetPoolInfoStrings();
       } else {
-        setPoolId((String)value);
+        setPoolInfoStrings((PoolInfoStrings)value);
       }
       break;
 
@@ -501,6 +535,14 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
       }
       break;
 
+    case DEADLINE:
+      if (value == null) {
+        unsetDeadline();
+      } else {
+        setDeadline((Long)value);
+      }
+      break;
+
     }
   }
 
@@ -518,8 +560,8 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
     case GROUP_IDS:
       return getGroupIds();
 
-    case POOL_ID:
-      return getPoolId();
+    case POOL_INFO_STRINGS:
+      return getPoolInfoStrings();
 
     case PRIORITY:
       return getPriority();
@@ -529,6 +571,9 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
 
     case URL:
       return getUrl();
+
+    case DEADLINE:
+      return Long.valueOf(getDeadline());
 
     }
     throw new IllegalStateException();
@@ -549,14 +594,16 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
       return isSetUserId();
     case GROUP_IDS:
       return isSetGroupIds();
-    case POOL_ID:
-      return isSetPoolId();
+    case POOL_INFO_STRINGS:
+      return isSetPoolInfoStrings();
     case PRIORITY:
       return isSetPriority();
     case NO_PREEMPT:
       return isSetNoPreempt();
     case URL:
       return isSetUrl();
+    case DEADLINE:
+      return isSetDeadline();
     }
     throw new IllegalStateException();
   }
@@ -610,12 +657,12 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
         return false;
     }
 
-    boolean this_present_poolId = true && this.isSetPoolId();
-    boolean that_present_poolId = true && that.isSetPoolId();
-    if (this_present_poolId || that_present_poolId) {
-      if (!(this_present_poolId && that_present_poolId))
+    boolean this_present_poolInfoStrings = true && this.isSetPoolInfoStrings();
+    boolean that_present_poolInfoStrings = true && that.isSetPoolInfoStrings();
+    if (this_present_poolInfoStrings || that_present_poolInfoStrings) {
+      if (!(this_present_poolInfoStrings && that_present_poolInfoStrings))
         return false;
-      if (!this.poolId.equals(that.poolId))
+      if (!this.poolInfoStrings.equals(that.poolInfoStrings))
         return false;
     }
 
@@ -643,6 +690,15 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
       if (!(this_present_url && that_present_url))
         return false;
       if (!this.url.equals(that.url))
+        return false;
+    }
+
+    boolean this_present_deadline = true && this.isSetDeadline();
+    boolean that_present_deadline = true && that.isSetDeadline();
+    if (this_present_deadline || that_present_deadline) {
+      if (!(this_present_deadline && that_present_deadline))
+        return false;
+      if (this.deadline != that.deadline)
         return false;
     }
 
@@ -702,12 +758,12 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
         return lastComparison;
       }
     }
-    lastComparison = Boolean.valueOf(isSetPoolId()).compareTo(typedOther.isSetPoolId());
+    lastComparison = Boolean.valueOf(isSetPoolInfoStrings()).compareTo(typedOther.isSetPoolInfoStrings());
     if (lastComparison != 0) {
       return lastComparison;
     }
-    if (isSetPoolId()) {
-      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.poolId, typedOther.poolId);
+    if (isSetPoolInfoStrings()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.poolInfoStrings, typedOther.poolInfoStrings);
       if (lastComparison != 0) {
         return lastComparison;
       }
@@ -738,6 +794,16 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
     }
     if (isSetUrl()) {
       lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.url, typedOther.url);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
+    lastComparison = Boolean.valueOf(isSetDeadline()).compareTo(typedOther.isSetDeadline());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetDeadline()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.deadline, typedOther.deadline);
       if (lastComparison != 0) {
         return lastComparison;
       }
@@ -784,13 +850,13 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
         case 4: // GROUP_IDS
           if (field.type == org.apache.thrift.protocol.TType.LIST) {
             {
-              org.apache.thrift.protocol.TList _list8 = iprot.readListBegin();
-              this.groupIds = new ArrayList<String>(_list8.size);
-              for (int _i9 = 0; _i9 < _list8.size; ++_i9)
+              org.apache.thrift.protocol.TList _list13 = iprot.readListBegin();
+              this.groupIds = new ArrayList<String>(_list13.size);
+              for (int _i14 = 0; _i14 < _list13.size; ++_i14)
               {
-                String _elem10; // required
-                _elem10 = iprot.readString();
-                this.groupIds.add(_elem10);
+                String _elem15; // required
+                _elem15 = iprot.readString();
+                this.groupIds.add(_elem15);
               }
               iprot.readListEnd();
             }
@@ -798,9 +864,10 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
             org.apache.thrift.protocol.TProtocolUtil.skip(iprot, field.type);
           }
           break;
-        case 5: // POOL_ID
-          if (field.type == org.apache.thrift.protocol.TType.STRING) {
-            this.poolId = iprot.readString();
+        case 5: // POOL_INFO_STRINGS
+          if (field.type == org.apache.thrift.protocol.TType.STRUCT) {
+            this.poolInfoStrings = new PoolInfoStrings();
+            this.poolInfoStrings.read(iprot);
           } else { 
             org.apache.thrift.protocol.TProtocolUtil.skip(iprot, field.type);
           }
@@ -823,6 +890,14 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
         case 8: // URL
           if (field.type == org.apache.thrift.protocol.TType.STRING) {
             this.url = iprot.readString();
+          } else { 
+            org.apache.thrift.protocol.TProtocolUtil.skip(iprot, field.type);
+          }
+          break;
+        case 9: // DEADLINE
+          if (field.type == org.apache.thrift.protocol.TType.I64) {
+            this.deadline = iprot.readI64();
+            setDeadlineIsSet(true);
           } else { 
             org.apache.thrift.protocol.TProtocolUtil.skip(iprot, field.type);
           }
@@ -862,19 +937,19 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
         oprot.writeFieldBegin(GROUP_IDS_FIELD_DESC);
         {
           oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, this.groupIds.size()));
-          for (String _iter11 : this.groupIds)
+          for (String _iter16 : this.groupIds)
           {
-            oprot.writeString(_iter11);
+            oprot.writeString(_iter16);
           }
           oprot.writeListEnd();
         }
         oprot.writeFieldEnd();
       }
     }
-    if (this.poolId != null) {
-      if (isSetPoolId()) {
-        oprot.writeFieldBegin(POOL_ID_FIELD_DESC);
-        oprot.writeString(this.poolId);
+    if (this.poolInfoStrings != null) {
+      if (isSetPoolInfoStrings()) {
+        oprot.writeFieldBegin(POOL_INFO_STRINGS_FIELD_DESC);
+        this.poolInfoStrings.write(oprot);
         oprot.writeFieldEnd();
       }
     }
@@ -896,6 +971,11 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
         oprot.writeString(this.url);
         oprot.writeFieldEnd();
       }
+    }
+    if (isSetDeadline()) {
+      oprot.writeFieldBegin(DEADLINE_FIELD_DESC);
+      oprot.writeI64(this.deadline);
+      oprot.writeFieldEnd();
     }
     oprot.writeFieldStop();
     oprot.writeStructEnd();
@@ -939,13 +1019,13 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
       }
       first = false;
     }
-    if (isSetPoolId()) {
+    if (isSetPoolInfoStrings()) {
       if (!first) sb.append(", ");
-      sb.append("poolId:");
-      if (this.poolId == null) {
+      sb.append("poolInfoStrings:");
+      if (this.poolInfoStrings == null) {
         sb.append("null");
       } else {
-        sb.append(this.poolId);
+        sb.append(this.poolInfoStrings);
       }
       first = false;
     }
@@ -973,6 +1053,12 @@ public class SessionInfo implements org.apache.thrift.TBase<SessionInfo, Session
       } else {
         sb.append(this.url);
       }
+      first = false;
+    }
+    if (isSetDeadline()) {
+      if (!first) sb.append(", ");
+      sb.append("deadline:");
+      sb.append(this.deadline);
       first = false;
     }
     sb.append(")");

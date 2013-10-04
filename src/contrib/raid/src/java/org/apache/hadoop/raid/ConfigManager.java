@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
@@ -33,13 +34,15 @@ import javax.xml.parsers.ParserConfigurationException;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 import org.w3c.dom.Text;
 import org.xml.sax.SAXException;
-
 import org.apache.hadoop.raid.protocol.PolicyInfo;
 import org.apache.hadoop.fs.Path;
 
@@ -60,13 +63,20 @@ class ConfigManager {
 
   public static final int DISTRAID_MAX_JOBS = 10;
 
-  public static final int DISTRAID_MAX_FILES = 10000;
+  public static final int DISTRAID_MAX_FILES = 5000;
+  
+  public static final String DIRRAID_BLOCK_LIMIT_KEY =
+      "hdfs.raid.dir.raid.block.limit";
+  
+  public static final int DEFAULT_DIRRAID_BLOCK_LIMIT = 5000;
 
   /**
    * Time to wait after the config file has been modified before reloading it
    * (this is done to prevent loading a file that hasn't been fully written).
    */
-  public static final long RELOAD_WAIT = 5 * 1000; 
+  public static final long RELOAD_WAIT = 5 * 1000;
+
+  private static final String DEFAULT_CONFIG_FILE = "raid.xml"; 
   
   private Configuration conf;    // Hadoop configuration
   private String configFileName; // Path to config XML file
@@ -80,6 +90,9 @@ class ConfigManager {
   private int maxJobsPerPolicy; // Max no. of jobs running simultaneously for
                                 // a job.
   private int maxFilesPerJob; // Max no. of files raided by a job.
+  private int maxBlocksPerDirRaidJob; // Max no. of blocks raided by a dir-raid job
+  // the url of the read reconstruction metrics
+  private String readReconstructionMetricsUrl;
 
   // Reload the configuration
   private boolean doReload;
@@ -93,9 +106,13 @@ class ConfigManager {
   ConfigManager() { }
 
   public ConfigManager(Configuration conf) throws IOException, SAXException,
-      RaidConfigurationException, ClassNotFoundException, ParserConfigurationException {
+      RaidConfigurationException, ClassNotFoundException, ParserConfigurationException,
+      JSONException {
     this.conf = conf;
     this.configFileName = conf.get("raid.config.file");
+    if (this.configFileName == null) {
+      this.configFileName = DEFAULT_CONFIG_FILE;
+    }
     this.doReload = conf.getBoolean("raid.config.reload", true);
     this.reloadInterval = conf.getLong("raid.config.reload.interval", RELOAD_INTERVAL);
     this.periodicity = conf.getLong("raid.policy.rescan.interval",  RESCAN_INTERVAL);
@@ -104,12 +121,10 @@ class ConfigManager {
                                         DISTRAID_MAX_JOBS);
     this.maxFilesPerJob = conf.getInt("raid.distraid.max.files",
                                       DISTRAID_MAX_FILES);
-    if (configFileName == null) {
-      String msg = "No raid.config.file given in conf - " +
-                   "the Hadoop Raid utility cannot run. Aborting....";
-      LOG.warn(msg);
-      throw new IOException(msg);
-    }
+    this.maxBlocksPerDirRaidJob = conf.getInt(DIRRAID_BLOCK_LIMIT_KEY,
+        DEFAULT_DIRRAID_BLOCK_LIMIT);
+    this.readReconstructionMetricsUrl = conf.get(
+                                "raid.read.reconstruction.metrics.url", "");
     reloadConfigs();
     lastSuccessfulReload = RaidNode.now();
     lastReloadAttempt = RaidNode.now();
@@ -166,12 +181,6 @@ class ConfigManager {
           <description> the replication factor of the RAID meta file
           </description>
         </property>
-        <property>
-          <name>stripeLength</name>
-          <value>10</value>
-          <description> the number of blocks to RAID together
-          </description>
-        </property>
       </policy>
    </configuration>
    *
@@ -182,9 +191,20 @@ class ConfigManager {
    * @throws ClassNotFoundException if user-defined policy classes cannot be loaded
    * @throws ParserConfigurationException if XML parser is misconfigured.
    * @throws SAXException if config file is malformed.
+   * @throws JSONException 
    * @returns A new set of policy categories.
    */
-  void reloadConfigs() throws IOException, ParserConfigurationException, 
+  void reloadConfigs() throws IOException, ParserConfigurationException,
+      SAXException, ClassNotFoundException, RaidConfigurationException, JSONException {
+    JSONObject json = (JSONObject) conf.getJsonConfig(configFileName);
+    if (json != null) {
+      reloadJSONConfigs(json);
+    } else {
+      reloadXmlConfigs();
+    }
+  }
+  
+  void reloadXmlConfigs() throws IOException, ParserConfigurationException, 
       SAXException, ClassNotFoundException, RaidConfigurationException {
 
     if (configFileName == null) {
@@ -238,7 +258,6 @@ class ConfigManager {
         PolicyInfo curr = new PolicyInfo(policyName, conf);
         PolicyInfo parent = null;
         NodeList policyElements = policy.getChildNodes();
-        PolicyInfo policyInfo = null;
         for (int j = 0; j < policyElements.getLength(); j++) {
           Node node1 = policyElements.item(j);
           if (!(node1 instanceof Element)) {
@@ -255,10 +274,10 @@ class ConfigManager {
             String text = ((Text)property.getFirstChild()).getData().trim();
             LOG.info(policyName + ".fileList = " + text);
             curr.setFileListPath(new Path(text));
-          } else if ("erasureCode".equalsIgnoreCase(propertyName)) {
+          } else if ("codecId".equalsIgnoreCase(propertyName)) {
             String text = ((Text)property.getFirstChild()).getData().trim();
-            LOG.info(policyName + ".erasureCode = " + text);
-            curr.setErasureCode(text);
+            LOG.info(policyName + ".codecId = " + text);
+            curr.setCodecId(text);
           } else if ("shouldRaid".equalsIgnoreCase(propertyName)) {
             String text = ((Text)property.getFirstChild()).getData().trim();
             curr.setShouldRaid(Boolean.parseBoolean(text));
@@ -313,6 +332,63 @@ class ConfigManager {
     return;
   }
 
+  private void reloadJSONConfigs(JSONObject json) throws JSONException, IOException {
+    if (json == null) {
+      json = (JSONObject) conf.getJsonConfig(configFileName);
+    }
+    ArrayList<PolicyInfo> newAllPolicies = new ArrayList<PolicyInfo>();
+    JSONArray policyArray = json.getJSONArray("fileListPolicies");
+    for (int i = 0; i < policyArray.length(); i++) {
+      loadPolicyInfoFromJSON(policyArray.getJSONObject(i), newAllPolicies);
+    }
+    policyArray = json.getJSONArray("srcPathPolicies");
+    for (int i = 0; i < policyArray.length(); i++) {
+      loadPolicyInfoFromJSON(policyArray.getJSONObject(i), newAllPolicies);
+    }
+    setAllPolicies(newAllPolicies);
+  }
+  
+  private void loadPolicyInfoFromJSON(JSONObject json,
+      Collection<PolicyInfo> policies) throws JSONException, IOException {
+    PolicyInfo policyInfo = new PolicyInfo(json.getString("name"), conf);
+    String key = null;
+    String stringVal = null;
+    Object value = null;
+    for (Iterator<?> keys = json.keys(); keys.hasNext();) {
+      key = (String) keys.next();
+      if (key == null || key.equals("")) continue;
+      value = json.get(key);
+
+      if (value instanceof String) {
+        stringVal = (String)value;
+      } else if (value instanceof Integer) {
+        stringVal = new Integer((Integer)value).toString();
+      } else if (value instanceof Long) {
+        stringVal = new Long((Long)value).toString();
+      } else if (value instanceof Double) {
+        stringVal = new Double((Double)value).toString();
+      } else if (value instanceof Boolean) {
+        stringVal = new Boolean((Boolean)value).toString();
+      } else {
+        LOG.warn("unsupported value in json object: " + value);
+      }
+
+      if (key.equals("description")) {
+        policyInfo.setDescription(stringVal);
+      } else if (key.equals("codecId")) {
+        policyInfo.setCodecId(stringVal);
+      } else if (key.equals("fileListPath")) {
+        policyInfo.setFileListPath(new Path(stringVal));
+      } else if (key.equals("srcPath")) {
+        policyInfo.setSrcPath(stringVal);
+      } else if (key.equals("shouldRaid")) {
+        policyInfo.setShouldRaid((Boolean)value);
+      } else {
+        policyInfo.setProperty(key, stringVal);
+      }
+    }
+    policies.add(policyInfo);
+  }
 
   public synchronized long getPeriodicity() {
     return periodicity;
@@ -329,12 +405,20 @@ class ConfigManager {
   public synchronized int getMaxFilesPerJob() {
     return maxFilesPerJob;
   }
+  
+  public synchronized int getMaxBlocksPerDirRaidJob() {
+    return maxBlocksPerDirRaidJob;
+  }
+  
+  public synchronized String getReadReconstructionMetricsUrl() {
+    return readReconstructionMetricsUrl;
+  }
 
   /**
    * Get a collection of all policies
    */
   public synchronized Collection<PolicyInfo> getAllPolicies() {
-    return new ArrayList(allPolicies);
+    return new ArrayList<PolicyInfo>(allPolicies);
   }
   
   /**
@@ -386,5 +470,19 @@ class ConfigManager {
         }
       }
     }
+  }
+  
+  /**
+   * Find the PolicyInfo corresponding to a given policy name
+   * @param policyName the name of a policy
+   * @return PolicyInfo if there is a matched policy; null otherwise
+   */
+  PolicyInfo getPolicy(String policyName) {
+    for (PolicyInfo policy : allPolicies) {
+      if (policyName.equals(policy.getName())) {
+        return policy;
+      }
+    }
+    return null;
   }
 }

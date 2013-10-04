@@ -18,19 +18,16 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.commons.logging.impl.Log4JLogger;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hdfs.DFSClient.DFSOutputStream;
 import org.apache.hadoop.hdfs.MiniDFSCluster.DataNodeProperties;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeID;
 import org.apache.hadoop.hdfs.protocol.FSConstants.SafeModeAction;
+import org.apache.hadoop.hdfs.server.datanode.BlockWithChecksumFileWriter;
 import org.apache.hadoop.hdfs.server.datanode.DataNode;
-import org.apache.hadoop.hdfs.server.datanode.DataStorage;
-import org.apache.hadoop.hdfs.server.datanode.FSDataset;
 import org.apache.hadoop.hdfs.server.datanode.FSDatasetTestUtil;
 import org.apache.hadoop.hdfs.server.datanode.NameSpaceSliceStorage;
 import org.apache.hadoop.hdfs.server.datanode.SimulatedFSDataset;
 import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
-import org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException;
 import org.apache.hadoop.hdfs.server.namenode.LeaseManager;
 import org.apache.hadoop.hdfs.server.namenode.NameNode;
 import org.apache.hadoop.hdfs.server.namenode.FSEditLog;
@@ -41,6 +38,7 @@ import org.apache.hadoop.fs.BlockLocation;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hdfs.protocol.ClientProxyRequests.CompleteRequest;
 import org.apache.log4j.Level;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
@@ -48,7 +46,9 @@ import org.mockito.stubbing.Answer;
 import static org.mockito.Matchers.anyBoolean;
 import static org.mockito.Matchers.anyInt;
 import static org.mockito.Matchers.anyObject;
+import static org.mockito.Matchers.anyLong;
 import static org.mockito.Matchers.anyString;
+import static org.mockito.Matchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.spy;
@@ -73,7 +73,7 @@ public class TestFileAppend4 extends TestCase {
     ((Log4JLogger)NameNode.stateChangeLog).getLogger().setLevel(Level.ALL);
     ((Log4JLogger)LeaseManager.LOG).getLogger().setLevel(Level.ALL);
     ((Log4JLogger)FSNamesystem.LOG).getLogger().setLevel(Level.ALL);
-    ((Log4JLogger)DataNode.LOG).getLogger().setLevel(Level.ALL);
+    DataNode.LOG.getLogger().setLevel(Level.ALL);
     ((Log4JLogger)DFSClient.LOG).getLogger().setLevel(Level.ALL);
   }
 
@@ -216,7 +216,8 @@ public class TestFileAppend4 extends TestCase {
    */
   private void corruptDataNode(int dnNumber, CorruptionType type) throws Exception {
     // get the FS data of the specified datanode
-    File ns_dir = cluster.getBlockDirectory("data" + Integer.toString(dnNumber*2 + 1)).getParentFile();
+    File ns_dir = cluster.getBlockDirectory("data" + Integer.toString(dnNumber*2 + 1))
+        .getParentFile().getParentFile();
     File data_dir = new File(ns_dir, MiniDFSCluster.RBW_DIR_NAME);
     int corrupted = 0;
     for (File block : data_dir.listFiles()) {
@@ -247,11 +248,12 @@ public class TestFileAppend4 extends TestCase {
           blockFile.close();
 
           RandomAccessFile metaFile = new RandomAccessFile(
-              FSDataset.findMetaFile(block), "rw");
+              BlockWithChecksumFileWriter.findMetaFile(block), "rw");
           metaFile.setLength(0);
           metaFile.close();
         } else if (type == CorruptionType.TRUNCATE_BLOCK_HALF) {
-          FSDatasetTestUtil.truncateBlockFile(block, block.length() / 2);
+          FSDatasetTestUtil.truncateBlockFile(block, block.length() / 2, false,
+              conf.getInt("io.bytes.per.checksum", 512));
         } else {
           assert false;
         }
@@ -338,7 +340,9 @@ public class TestFileAppend4 extends TestCase {
 
       // Delay completeFile
       DelayAnswer delayer = new DelayAnswer();
-      doAnswer(delayer).when(spyNN).complete(anyString(), anyString());
+      doAnswer(delayer).when(spyNN).complete(anyString(), anyString(), anyLong(), 
+          (Block)anyObject());
+      doAnswer(delayer).when(spyNN).complete(any(CompleteRequest.class));
 
       DFSClient client = new DFSClient(null, spyNN, conf, null);
       file1 = new Path("/testRecoverFinalized");
@@ -378,11 +382,14 @@ public class TestFileAppend4 extends TestCase {
       t.join();
       LOG.info("Close finished.");
 
-      // We expect that close will get a "Could not complete file"
-      // error.
+      // We expect that close will get a last block mismatch error
+      // because the recover will update the block generation stamp in 
+      // the namenode which mismatches that known by the old client 
       Throwable thrownByClose = err.get();
       assertNotNull(thrownByClose);
-      assertTrue(thrownByClose instanceof LeaseExpiredException);
+      assertTrue(thrownByClose.getMessage().
+          startsWith("Try close a closed file: last block from " + 
+              "client side doesn't match name-node"));
     } finally {
       cluster.shutdown();
     }
@@ -544,10 +551,11 @@ public class TestFileAppend4 extends TestCase {
     ArrayList<File> files = new ArrayList<File>();
     for (String dirString : dfsDataDirs.split(",")) {
       int nsId = cluster.getNameNode(0).getNamespaceID();
-      File curDataDir = new File(dirString + MiniDFSCluster.FINALIZED_DIR_NAME);
+      File curDataDir = new File(dirString, MiniDFSCluster.CURRENT_DIR_NAME);
       File dir = NameSpaceSliceStorage.getNsRoot(nsId, curDataDir);
-      assertTrue("data dir " + dir + " should exist",
-        dir.exists());
+      File finalizedDir = new File(dir, MiniDFSCluster.FINALIZED_DIR_NAME);
+      assertTrue("data dir " + finalizedDir + " should exist",
+          finalizedDir.exists());
       File bbwDir = new File(dir, MiniDFSCluster.RBW_DIR_NAME);
       assertTrue("bbw dir " + bbwDir + " should eixst",
         bbwDir.exists());
@@ -984,7 +992,13 @@ public class TestFileAppend4 extends TestCase {
    */
   public void testTruncatedPrimaryDN() throws Exception {
     LOG.info("START");
-    runDNRestartCorruptType(CorruptionType.TRUNCATE_BLOCK_TO_ZERO);
+    boolean oldInlineChecksum = conf.getBoolean("dfs.use.inline.checksum", true);
+    conf.setBoolean("dfs.use.inline.checksum", false);
+    try {
+      runDNRestartCorruptType(CorruptionType.TRUNCATE_BLOCK_TO_ZERO);
+    } finally {
+      conf.setBoolean("dfs.use.inline.checksum", oldInlineChecksum);
+    }
   }
 
   /**
@@ -994,7 +1008,13 @@ public class TestFileAppend4 extends TestCase {
    */
   public void testHalfLengthPrimaryDN() throws Exception {
     LOG.info("START");
-    runDNRestartCorruptType(CorruptionType.TRUNCATE_BLOCK_HALF);
+    boolean oldInlineChecksum = conf.getBoolean("dfs.use.inline.checksum", true);
+    conf.setBoolean("dfs.use.inline.checksum", false);
+    try {
+      runDNRestartCorruptType(CorruptionType.TRUNCATE_BLOCK_HALF);
+    } finally {
+      conf.setBoolean("dfs.use.inline.checksum", oldInlineChecksum);
+    }
   }
 
   private void runDNRestartCorruptType(CorruptionType corrupt) throws Exception {
@@ -1038,6 +1058,8 @@ public class TestFileAppend4 extends TestCase {
   }
 
   public void testFullClusterPowerLoss() throws Exception {
+    boolean oldInlineChecksum = conf.getBoolean("dfs.use.inline.checksum", true);
+    conf.setBoolean("dfs.use.inline.checksum", false);
     cluster = new MiniDFSCluster(conf, 2, true, null);
     FileSystem fs1 = cluster.getFileSystem();
     try {
@@ -1074,7 +1096,9 @@ public class TestFileAppend4 extends TestCase {
       cluster.waitForDNHeartbeat(1, 10000);
 
       // Recover the lease
-      FileSystem fs2 = AppendTestUtil.createHdfsWithDifferentUsername(fs1.getConf());
+      Configuration conf1 = fs1.getConf();
+      conf1.setBoolean("dfs.use.inline.checksum", false);
+      FileSystem fs2 = AppendTestUtil.createHdfsWithDifferentUsername(conf1);
       recoverFile(fs2);
 
       assertFileSize(fs2, 512);
@@ -1082,6 +1106,7 @@ public class TestFileAppend4 extends TestCase {
     } finally {
       // explicitly do not shut down fs1, since it's been frozen up by
       // killing the DataStreamer and not allowing recovery
+      conf.setBoolean("dfs.use.inline.checksum", oldInlineChecksum);
       cluster.shutdown();
     }
   }
@@ -1148,6 +1173,21 @@ public class TestFileAppend4 extends TestCase {
       stm = fs1.create(file1, true, (int)BLOCK_SIZE*2, rep, BLOCK_SIZE);
       AppendTestUtil.write(stm, 0, halfBlock);
       stm.close();
+      
+      // Wait for all blocks reported to namenode
+      long startTime = System.currentTimeMillis();
+      while(true) {
+        if (((DistributedFileSystem) fs1).dfs
+            .getLocatedBlocks(file1.toString(), 0, 1).getLocatedBlocks().get(0)
+            .getLocations().length == rep) {
+          break;
+        }
+        if (System.currentTimeMillis() - startTime > 2000) {
+          TestCase.fail();
+        } else {
+          Thread.sleep(50);
+        }
+      }
 
       NameNode nn = cluster.getNameNode();
       LOG.info("======== Appending");

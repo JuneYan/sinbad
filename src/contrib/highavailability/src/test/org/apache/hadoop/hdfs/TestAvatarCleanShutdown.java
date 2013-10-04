@@ -21,8 +21,11 @@ package org.apache.hadoop.hdfs;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.PrintWriter;
-import java.util.Iterator;
+
+import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FileUtil;
+import org.apache.hadoop.fs.Path;
 
 import org.junit.Test;
 import org.junit.After;
@@ -38,78 +41,56 @@ import org.apache.hadoop.conf.Configuration;
 import java.util.Set;
 import java.util.HashSet;
 
+import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.server.datanode.AvatarDataNode;
+import org.apache.hadoop.hdfs.util.InjectionEvent;
 import org.apache.hadoop.hdfs.MiniAvatarCluster;
 import org.apache.hadoop.hdfs.MiniAvatarCluster.DataNodeProperties;
 import org.apache.hadoop.hdfs.MiniAvatarCluster.NameNodeInfo;
+import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.util.InjectionEventI;
+import org.apache.hadoop.util.InjectionHandler;
 
 public class TestAvatarCleanShutdown {
   final static Log LOG = LogFactory.getLog(TestAvatarCleanShutdown.class);
 
   private static final String HOST_FILE_PATH = "/tmp/include_file";
+  private String hosts;
 
   private Configuration conf;
   private MiniAvatarCluster cluster;
   private boolean federation;
   private Set<Thread> oldThreads;
 
-  // A list of threads that might hang around (maybe due to a JVM bug).
-  private static final String[] excludedThreads = { "SunPKCS11" };
-
   @BeforeClass
   public static void setUpStatic() throws Exception {
     MiniAvatarCluster.createAndStartZooKeeper();
   }
 
-  public void setUp() throws Exception {
+  public void setUp(String name) throws Exception {
+    LOG.info("------------------- test: " + name + ", federation: "
+        + federation + " START ----------------");
     oldThreads = new HashSet<Thread>(Thread.getAllStackTraces().keySet());
 
     conf = new Configuration();
-    File f = new File(HOST_FILE_PATH);
-    if (f.exists()) {
-      f.delete();
-    }
-    conf.set("dfs.hosts", HOST_FILE_PATH);
+    hosts = HOST_FILE_PATH + "_" + System.currentTimeMillis();
+    File f = new File(hosts);
+    f.delete();
+    f.createNewFile();
+    conf.set(FSConstants.DFS_HOSTS, hosts);
     conf.setInt("dfs.datanode.failed.volumes.tolerated", 0);
     if (!federation) {
-      cluster = new MiniAvatarCluster(conf, 1, true, null, null);
+      cluster = new MiniAvatarCluster.Builder(conf).build();
     } else {
-      cluster = new MiniAvatarCluster(conf, 1, true, null, null, 2, true);
+      cluster = new MiniAvatarCluster.Builder(conf)
+      		.numNameNodes(2).federation(true).build();
     }
     federation = false;
   }
   
-  private boolean isExcludedThread(Thread th) {
-    for (String badThread : excludedThreads) {
-      if (th.getName().contains(badThread)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private void checkRemainingThreads(Set<Thread> old) throws Exception {
-    Thread.sleep(5000);
-    Set<Thread> threads = Thread.getAllStackTraces().keySet();
-    threads.removeAll(old);
-    if (threads.size() != 0) {
-      LOG.error("Following threads are not clean up:");
-      Iterator<Thread> it = threads.iterator();
-      while (it.hasNext()) {
-        Thread th = it.next();
-        if (isExcludedThread(th)) {
-          it.remove();
-          continue;
-        }
-        LOG.error("Thread: " + th.getName());
-      }
-    }
-    assertTrue("This is not a clean shutdown", threads.size() == 0);
-  }
-  
   private void writeWrongIncludeFile(Configuration conf) throws Exception {
-    String includeFN = conf.get("dfs.hosts", "");
-    assertTrue(includeFN.equals(HOST_FILE_PATH));
+    String includeFN = conf.get(FSConstants.DFS_HOSTS, "");
+    assertTrue(includeFN.equals(hosts));
     File f = new File(includeFN);
     if (f.exists()) {
       f.delete();
@@ -124,7 +105,7 @@ public class TestAvatarCleanShutdown {
   
   @Test
   public void testVolumeFailureShutdown() throws Exception {
-    setUp();
+    setUp("testVolumeFailureShutdown");
     LOG.info("Corrupt the volume");
     DataNodeProperties dnp = cluster.getDataNodeProperties().get(0);
     String[] dataDirs = dnp.conf.getStrings("dfs.data.dir");
@@ -144,7 +125,7 @@ public class TestAvatarCleanShutdown {
 
   @Test
   public void testRuntimeDisallowedDatanodeShutdown() throws Exception {
-    setUp();
+    setUp("testRuntimeDisallowedDatanodeShutdown");
     LOG.info("Update include file to not include datanode");
     NameNodeInfo nni = cluster.getNameNode(0);
     writeWrongIncludeFile(nni.conf);
@@ -159,7 +140,7 @@ public class TestAvatarCleanShutdown {
   
   @Test
   public void testStartupDisallowedDatanodeShutdown() throws Exception {
-    setUp();
+    setUp("testStartupDisallowedDatanodeShutdown");
     LOG.info("Update include file to not include datanode");
     NameNodeInfo nni = cluster.getNameNode(0);
     writeWrongIncludeFile(nni.conf);
@@ -179,7 +160,7 @@ public class TestAvatarCleanShutdown {
 
   @Test
   public void testNormalShutdown() throws Exception {
-    setUp();
+    setUp("testNormalShutdown");
     LOG.info("shutdown cluster");
     cluster.shutDown();
   }
@@ -189,33 +170,63 @@ public class TestAvatarCleanShutdown {
     federation = true;
     testNormalShutdown();
   }
-  
-  @Test
-  public void testRuntimeDisallowedDatanodeShutdownFederation() throws Exception {
-    federation = true;
-    testRuntimeDisallowedDatanodeShutdown();
-  }
 
-  @Test
-  public void testStartupDisallowedDatanodeShutdownFederation() throws Exception {
-    federation = true;
-    testStartupDisallowedDatanodeShutdown();
-  }
-  
   @Test
   public void testVolumeFailureShutdownFederation() throws Exception { 
     federation = true;
     testVolumeFailureShutdown();
   }
 
+  @Test
+  public void testDataXeiverServerFailureShutdown() throws Exception {
+    setUp("testDataXeiverServerFailureShutdown");
+    LOG.info("Inject a RuntimeException to DataXeiverServer");
+    InjectionHandler.set(new TestAvatarDatanodeShutdownHandler());
+    final FileSystem fileSys = cluster.getFileSystem(0);
+    FSDataOutputStream out = null;
+    try {
+      final Path fileName = new Path("/testFile");
+      out = TestFileCreation.createFile(
+          fileSys, fileName, cluster.getDataNodes().size());
+      // trigger the failure
+      TestFileCreation.writeFile(out);
+    } finally {
+      IOUtils.closeStream(out);
+      fileSys.close();
+      cluster.getDataNodes().get(0).waitAndShutdown();
+      cluster.shutDownAvatarNodes();
+    }
+  }
+  
+  @Test
+  public void testDataXeiverServerFailureShutdownFederation() throws Exception {
+    federation = true;
+    testDataXeiverServerFailureShutdown();
+  }
+  
   @After
   public void shutDown() throws Exception {
-    checkRemainingThreads(oldThreads);
+    if (cluster != null) {
+      cluster.shutDown();
+    }
+    new File(hosts).delete();
+    DFSTestThreadUtil.checkRemainingThreads(oldThreads);
   }
 
   @AfterClass
   public static void shutDownStatic() throws Exception {
     MiniAvatarCluster.shutDownZooKeeper();
+  }
+
+  private static class TestAvatarDatanodeShutdownHandler extends InjectionHandler {
+    @Override 
+    protected void _processEvent(InjectionEventI event, Object... args) {
+      LOG.debug("processEvent: processing event: " + event);
+      
+      if (event == InjectionEvent.AVATARXEIVER_RUNTIME_FAILURE) {
+        throw new RuntimeException("Injected failure");
+      }
+    }
   }
 
 }

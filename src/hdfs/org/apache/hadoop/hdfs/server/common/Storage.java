@@ -34,9 +34,13 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.server.common.HdfsConstants.NodeType;
 import org.apache.hadoop.hdfs.server.common.HdfsConstants.StartupOption;
-import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+import org.apache.hadoop.hdfs.util.InjectionEvent;
 import org.apache.hadoop.fs.FileUtil;
+import org.apache.hadoop.util.InjectionHandler;
+import org.apache.hadoop.util.ToolRunner;
 import org.apache.hadoop.util.VersionInfo;
+
+import com.google.common.base.Preconditions;
 
 
 
@@ -64,7 +68,7 @@ public abstract class Storage extends StorageInfo {
   // Constants
   
   // last layout version that did not suppot upgrades
-  protected static final int LAST_PRE_UPGRADE_LAYOUT_VERSION = -3;
+  public static final int LAST_PRE_UPGRADE_LAYOUT_VERSION = -3;
   
   // this corresponds to Hadoop-0.14.
   public static final int LAST_UPGRADABLE_LAYOUT_VERSION = -7;
@@ -78,6 +82,7 @@ public abstract class Storage extends StorageInfo {
   protected static final String STORAGE_FILE_VERSION  = "VERSION";
   public static final String STORAGE_DIR_CURRENT   = "current";
   public final static String STORAGE_DIR_RBW = "rbw";
+  public final static String OLD_STORAGE_DIR_RBW = "blocksBeingWritten";
   public final static String STORAGE_DIR_FINALIZED = "finalized";
   protected static final String STORAGE_DIR_PREVIOUS  = "previous";
   private   static final String STORAGE_TMP_REMOVED   = "removed.tmp";
@@ -85,24 +90,28 @@ public abstract class Storage extends StorageInfo {
   private   static final String STORAGE_TMP_FINALIZED = "finalized.tmp";
   private   static final String STORAGE_TMP_LAST_CKPT = "lastcheckpoint.tmp";
   private   static final String STORAGE_PREVIOUS_CKPT = "previous.checkpoint";
+  public   static final String STORAGE_BLOCK_CRC = "blockcrc";
+  public   static final String STORAGE_TMP_BLOCK_CRC = "blockcrc.tmp";
   
   // meta info property names
   protected static final String STORAGE_TYPE = "storageType";
-  protected static final String NAMESPACE_ID = "namespaceID";
-  protected static final String LAYOUT_VERSION = "layoutVersion";
-  protected static final String CHECK_TIME = "cTime";
+  public static final String NAMESPACE_ID = "namespaceID";
+  public static final String LAYOUT_VERSION = "layoutVersion";
+  public static final String CHECK_TIME = "cTime";
   
   public enum StorageState {
     NON_EXISTENT,
     NOT_FORMATTED,
     COMPLETE_UPGRADE,
+    UPGRADE_DONE,
     RECOVER_UPGRADE,
     COMPLETE_FINALIZE,
     COMPLETE_ROLLBACK,
     RECOVER_ROLLBACK,
     COMPLETE_CHECKPOINT,
     RECOVER_CHECKPOINT,
-    NORMAL;
+    NORMAL,
+    INCONSISTENT;
   }
 
   /**
@@ -193,10 +202,56 @@ public abstract class Storage extends StorageInfo {
     return buf.toString();
   }
   
+  public static Properties getProps(File from) throws IOException {
+    RandomAccessFile file = new RandomAccessFile(from, "rws");
+    FileInputStream in = null;
+    try {
+      in = new FileInputStream(file.getFD());
+      file.seek(0);
+      Properties props = new Properties();
+      props.load(in);
+      return props;
+    } finally {
+      if (in != null) {
+        in.close();
+      }
+      file.close();
+    }
+  }
+
+  public static void writeProps(File to, Properties props) throws IOException {
+    RandomAccessFile file = new RandomAccessFile(to, "rws");
+    FileOutputStream out = null;
+    try {
+      file.seek(0);
+      out = new FileOutputStream(file.getFD());
+      /*
+       * If server is interrupted before this line, the version file will remain
+       * unchanged.
+       */
+      props.store(out, null);
+      /*
+       * Now the new fields are flushed to the head of the file, but file length
+       * can still be larger then required and therefore the file can contain
+       * whole or corrupted fields from its old contents in the end. If server
+       * is interrupted here and restarted later these extra fields either
+       * should not effect server behavior or should be handled by the server
+       * correctly.
+       */
+      file.setLength(out.getChannel().position());
+    } finally {
+      if (out != null) {
+        out.close();
+      }
+      file.close();
+    }
+  }
+
+
   /**
    * One of the storage directories.
    */
-  public class StorageDirectory {
+  public class StorageDirectory implements FormatConfirmable {
     File              root; // root directory
     final boolean useLock;  // flag to enable storage lock
     FileLock          lock; // storage lock
@@ -216,6 +271,11 @@ public abstract class Storage extends StorageInfo {
       this.lock = null;
       this.dirType = dirType;
       this.useLock = useLock;
+    }
+    
+    @Override
+    public String toString() {
+      return "Storage Directory " + this.root;
     }
     
     /**
@@ -242,20 +302,8 @@ public abstract class Storage extends StorageInfo {
     }
 
     public void read(File from) throws IOException {
-      RandomAccessFile file = new RandomAccessFile(from, "rws");
-      FileInputStream in = null;
-      try {
-        in = new FileInputStream(file.getFD());
-        file.seek(0);
-        Properties props = new Properties();
-        props.load(in);
-        getFields(props, this);
-      } finally {
-        if (in != null) {
-          in.close();
-        }
-        file.close();
-      }
+      Properties props = getProps(from);
+      getFields(props, this);
     }
 
     /**
@@ -271,37 +319,14 @@ public abstract class Storage extends StorageInfo {
     public void write(File to) throws IOException {
       Properties props = new Properties();
       setFields(props, this);
-      RandomAccessFile file = new RandomAccessFile(to, "rws");
-      FileOutputStream out = null;
-      try {
-        file.seek(0);
-        out = new FileOutputStream(file.getFD());
-        /*
-         * If server is interrupted before this line,
-         * the version file will remain unchanged.
-         */
-        props.store(out, null);
-        /*
-         * Now the new fields are flushed to the head of the file, but file
-         * length can still be larger then required and therefore the file can
-         * contain whole or corrupted fields from its old contents in the end.
-         * If server is interrupted here and restarted later these extra fields
-         * either should not effect server behavior or should be handled
-         * by the server correctly.
-         */
-        file.setLength(out.getChannel().position());
-      } finally {
-        if (out != null) {
-          out.close();
-        }
-        file.close();
-      }
+      writeProps(to, props);
     }
 
     /**
      * Clear and re-create storage directory.
      * <p>
      * Removes contents of the current directory and creates an empty directory.
+     * Removes other contents under the root directory 
      *
      * This does not fully format storage directory.
      * It cannot write the version file since it should be written last after
@@ -312,12 +337,63 @@ public abstract class Storage extends StorageInfo {
      * @throws IOException
      */
     public void clearDirectory() throws IOException {
+      File rootDir = this.getRootDir();
+      if (rootDir.exists()) {
+        File contents[] = rootDir.listFiles();
+        for (int i = 0; i < contents.length; i++) {
+          if (contents[i].getName().equals(STORAGE_FILE_LOCK)) {
+            continue;
+          }
+          if (!(FileUtil.fullyDelete(contents[i])))
+            throw new IOException("Cannot remove content: " + contents[i]);
+        }
+      }
       File curDir = this.getCurrentDir();
-      if (curDir.exists())
-        if (!(FileUtil.fullyDelete(curDir)))
-          throw new IOException("Cannot remove current directory: " + curDir);
       if (!curDir.mkdirs())
-        throw new IOException("Cannot create directory " + curDir);
+        throw new IOException("Cannot create current directory " + curDir);
+    }
+
+    public boolean isEmpty() throws IOException {
+      File rootDir = this.getRootDir();
+      if (!rootDir.exists()) {
+        throw new IOException("Directory " + rootDir + " does not exist!");
+      }
+      String contents[] = rootDir.list();
+      if (contents == null) {
+        throw new IOException("Unable to list files in " + rootDir);
+      }
+      if (contents.length == 1 && this.useLock) { // Ignore lock file
+        return contents[0].equals(STORAGE_FILE_LOCK);
+      }
+      return contents.length == 0;
+    }
+    
+    /**
+     * @return true if the storage directory should prompt the user prior
+     * to formatting (i.e if the directory appears to contain some data)
+     * @throws IOException if the SD cannot be accessed due to an IO error
+     */
+    private boolean hasSomeData() throws IOException {
+      // Its alright for a dir not to exist, or to exist (properly accessible)
+      // and be completely empty.
+      if (!root.exists()) return false;
+      
+      if (!root.isDirectory()) {
+        LOG.info("Root is not a directory: " + this);
+        // a file where you expect a directory should not cause silent
+        // formatting
+        return true;
+      }
+      
+      if (FileUtil.listFiles(root).length == 0) {
+        // Empty dir can format without prompt.
+        return false;
+      }      
+      return true;
+    }
+
+    public File getRootDir() {
+      return root;
     }
 
     public File getCurrentDir() {
@@ -445,6 +521,10 @@ public abstract class Storage extends StorageInfo {
         if (hasCurrent)
           return StorageState.COMPLETE_UPGRADE;
         return StorageState.RECOVER_UPGRADE;
+      }
+
+      if (hasPrevious && hasCurrent) {
+        return StorageState.UPGRADE_DONE;
       }
 
       assert hasRemovedTmp : "hasRemovedTmp must be true";
@@ -579,6 +659,16 @@ public abstract class Storage extends StorageInfo {
       lock.channel().close();
       lock = null;
     }
+
+    @Override
+    public boolean hasSomeJournalData() throws IOException {
+      return hasSomeData();
+    }
+
+    @Override
+    public boolean hasSomeImageData() throws IOException {
+      return hasSomeData();
+    }
   }
 
   /**
@@ -630,7 +720,7 @@ public abstract class Storage extends StorageInfo {
    * 
    * @param oldVersion
    */
-  protected static void checkVersionUpgradable(int oldVersion) 
+  public static void checkVersionUpgradable(int oldVersion) 
                                      throws IOException {
     if (oldVersion > LAST_UPGRADABLE_LAYOUT_VERSION) {
       String msg = "*********** Upgrade is not supported from this older" +
@@ -709,7 +799,36 @@ public abstract class Storage extends StorageInfo {
                             + from.getCanonicalPath() + " to " + to.getCanonicalPath());
   }
 
-  protected static void deleteDir(File dir) throws IOException {
+  public static void upgradeDirectory(StorageDirectory sd) throws IOException {
+    File curDir = sd.getCurrentDir();
+    File prevDir = sd.getPreviousDir();
+    File tmpDir = sd.getPreviousTmp();
+    assert curDir.exists() : "Current directory must exist.";
+    assert !prevDir.exists() : "prvious directory must not exist.";
+    assert !tmpDir.exists() : "prvious.tmp directory must not exist.";
+
+    // rename current to tmp
+    rename(curDir, tmpDir);
+
+    if (!curDir.mkdir()) {
+      throw new IOException("Cannot create directory " + curDir);
+    }
+  }
+
+  public static void completeUpgrade(StorageDirectory sd) throws IOException {
+    // Write the version file, since saveFsImage above only makes the
+    // fsimage, and the directory is otherwise empty.
+    sd.write();
+    InjectionHandler
+        .processEventIO(InjectionEvent.FSIMAGE_UPGRADE_AFTER_SAVE_IMAGE);
+
+    File prevDir = sd.getPreviousDir();
+    File tmpDir = sd.getPreviousTmp();
+    // rename tmp to previous
+    rename(tmpDir, prevDir);
+  }
+
+  public static void deleteDir(File dir) throws IOException {
     if (!FileUtil.fullyDelete(dir))
       throw new IOException("Failed to delete " + dir.getCanonicalPath());
   }
@@ -844,4 +963,92 @@ public abstract class Storage extends StorageInfo {
     file.writeBytes(messageForPreUpgradeVersion);
     file.getFD().sync();
   }  
+  
+  public Iterable<StorageDirectory> dirIterable(final StorageDirType dirType) {
+    return new Iterable<StorageDirectory>() {
+      @Override
+      public Iterator<StorageDirectory> iterator() {
+        return dirIterator(dirType);
+      }
+    };
+  }
+  
+  /**
+   * Interface for classes which need to have the user confirm their
+   * formatting during NameNode -format and other similar operations.
+   * 
+   * This is currently a storage directory or journal manager.
+   */
+  public interface FormatConfirmable {
+    /**
+     * @return true if the storage seems to have some valid journal data in it,
+     * and the user should be required to confirm the format. Otherwise,
+     * false.
+     * @throws IOException if the storage cannot be accessed at all.
+     */
+    public boolean hasSomeJournalData() throws IOException;
+    
+    /**
+     * @return true if the storage seems to have some valid image data in it,
+     * and the user should be required to confirm the format. Otherwise,
+     * false.
+     * @throws IOException if the storage cannot be accessed at all.
+     */
+    public boolean hasSomeImageData() throws IOException;
+    
+    /**
+     * @return a string representation of the formattable item, suitable
+     * for display to the user inside a prompt
+     */
+    @Override
+    public String toString();
+  }
+  
+  /**
+   * Iterate over each of the {@link FormatConfirmable} objects,
+   * potentially checking with the user whether it should be formatted.
+   * 
+   * If running in interactive mode, will prompt the user for each
+   * directory to allow them to format anyway. Otherwise, returns
+   * false, unless 'force' is specified.
+   * 
+   * @param interactive prompt the user when a dir exists
+   * @return true if formatting should proceed
+   * @throws IOException if some storage cannot be accessed
+   */
+  public static boolean confirmFormat(
+      Iterable<? extends FormatConfirmable> items, boolean force,
+      boolean interactive)
+      throws IOException {
+    for (FormatConfirmable item : items) {
+      if (!(item.hasSomeJournalData() || item.hasSomeImageData()))
+        continue;
+      if (force) { // Don't confirm, always format.
+        System.err.println(
+            "Data exists in " + item + ". Formatting anyway.");
+        continue;
+      }
+      if (!interactive) { // Don't ask - always don't format
+        System.err.println(
+            "Running in non-interactive mode, and data appears to exist in " +
+            item + ". Not formatting.");
+        return false;
+      }
+      if (!ToolRunner.confirmPrompt("Re-format filesystem in " + item + " ?")) {
+        System.err.println("Format aborted in " + item);
+        return false;
+      }
+    }
+    
+    return true;
+  }
+  
+  /**
+   * @return the storage directory, with the precondition that this storage
+   * has exactly one storage directory
+   */
+  public StorageDirectory getSingularStorageDir() {
+    Preconditions.checkState(storageDirs.size() == 1);
+    return storageDirs.get(0);
+  }
 }

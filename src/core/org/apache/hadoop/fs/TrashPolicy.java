@@ -52,7 +52,16 @@ public abstract class TrashPolicy extends Configured {
    */ 
   public abstract boolean moveToTrash(Path path) throws IOException;
 
-  /** 
+  /**
+   * Move a file out of the current user's Trash
+   * @param path path to undelete. In other words, the path that will
+   * be restored
+   * @return true if a file was moved out of trash, or false
+   * @throws IOException
+   */
+  public abstract boolean moveFromTrash(Path path) throws IOException;
+ 
+ /** 
    * Create a trash checkpoint. 
    */
   public abstract void createCheckpoint() throws IOException;
@@ -65,7 +74,7 @@ public abstract class TrashPolicy extends Configured {
   /**
    * Get the current working directory of the Trash Policy
    */
-  public abstract Path getCurrentTrashDir();
+  public abstract Path getCurrentTrashDir() throws IOException;
 
   /** 
    * Return a {@link Runnable} that periodically empties the trash of all

@@ -38,6 +38,7 @@ abstract class ImageVisitor {
     LAYOUT_VERSION,
     NUM_INODES,
     GENERATION_STAMP,
+    LAST_TXID,
     INODES,
     INODE,
     INODE_PATH,
@@ -71,7 +72,13 @@ abstract class ImageVisitor {
     NUM_DELEGATION_TOKENS,
     DELEGATION_TOKENS,
     DELEGATION_TOKEN_IDENTIFIER,
-    DELEGATION_TOKEN_EXPIRY_TIME
+    DELEGATION_TOKEN_EXPIRY_TIME,
+    INODE_TYPE,
+    INODE_HARDLINK_ID,
+    RAID_CODEC_ID,
+    LAST_INODE_ID,
+    INODE_ID,
+    BLOCK_CHECKSUM
   }
   
   /**
@@ -107,6 +114,11 @@ abstract class ImageVisitor {
   }
 
   void visit(ImageElement element, long value) throws IOException {
+    if (element == ImageElement.ACCESS_TIME ||
+        element == ImageElement.MODIFICATION_TIME) {
+      visit(element, ImageLoaderCurrent.formatDate(value));
+      return;
+    }
     visit(element, Long.toString(value));
   }
 
@@ -151,4 +163,10 @@ abstract class ImageVisitor {
    * processing the blocks that compromise a file.
    */
   abstract void leaveEnclosingElement() throws IOException;
+  
+  /**
+   * Tell the image visitor how many files there are in the image
+   * @param numberOfFiles
+   */
+  abstract void setNumberOfFiles(long numberOfFiles) throws IOException;
 }

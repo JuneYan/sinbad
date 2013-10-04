@@ -54,8 +54,8 @@ public class TestFastCopyCLI extends FastCopySetupUtil {
   public static void setUpClass() throws Exception {
     conf = new Configuration();
     remoteConf = new Configuration();
-    conf.setBoolean("dfs.block.copy.hardlink", false);
-    remoteConf.setBoolean("dfs.block.copy.hardlink", false);
+    conf.setBoolean("dfs.datanode.blkcopy.hardlink", false);
+    remoteConf.setBoolean("dfs.datanode.blkcopy.hardlink", false);
     FastCopySetupUtil.setUpClass();
     // Each file is prefixed with this.
     srcPrefix = "/testFastCopyShellGlob/";
@@ -135,7 +135,7 @@ public class TestFastCopyCLI extends FastCopySetupUtil {
   public void testDstDirectoryNonExistent() throws Exception {
     try {
       testFastCopyShellGlob(false, new String[] { "f1" }, new String[] {
-        srcPrefix + "d1/", srcPrefix + "d1/d2/", srcPrefix + "dx/"}, "",
+        srcPrefix + "d1/", srcPrefix + "d1/d2/", srcPrefix + "dx1/"}, "",
         "", false);
     } catch (IllegalArgumentException e) {
       return;
@@ -146,8 +146,8 @@ public class TestFastCopyCLI extends FastCopySetupUtil {
   @Test
   public void testSingleDirRename() throws Exception {
     testFastCopyShellGlob(false, new String[] { "f9", "f10" }, new String[] {
-      srcPrefix + "d1/d3/", srcPrefix + "dx/"}, srcPrefix + "d1/d3/",
-      srcPrefix + "dx/", false);
+      srcPrefix + "d1/d3/", srcPrefix + "dx3/"}, srcPrefix + "d1/d3/",
+      srcPrefix + "dx3/", false);
   }
 
   
@@ -155,7 +155,7 @@ public class TestFastCopyCLI extends FastCopySetupUtil {
   public void srcNonExistent() throws Exception {
     try {
       testFastCopyShellGlob(false, new String[] { "f1" }, new String[] {
-        srcPrefix + "d2/", srcPrefix + "dx/" }, "",
+        srcPrefix + "d2/", srcPrefix + "dx2/" }, "",
         "", false);
     } catch (IOException e) {
       return;

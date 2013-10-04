@@ -19,12 +19,18 @@ package org.apache.hadoop.hdfs.server.namenode;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Random;
 
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.fs.permission.PermissionStatus;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.server.common.GenerationStamp;
 import org.apache.hadoop.hdfs.server.common.Storage;
+import org.apache.hadoop.hdfs.server.common.Util;
 import org.apache.hadoop.hdfs.server.namenode.BlocksMap.BlockInfo;
 
 /**
@@ -59,17 +65,19 @@ public class CreateEditsLog {
   static void addFiles(FSEditLog editLog, int numFiles, short replication, 
                          int blocksPerFile, long startingBlockId,
                          FileNameGenerator nameGenerator) {
-    
+    Random rng = new Random();
     PermissionStatus p = new PermissionStatus("joeDoe", "people",
                                       new FsPermission((short)0777));
-    INodeDirectory dirInode = new INodeDirectory(p, 0L);
+    INodeId inodeId = new INodeId();
+    INodeDirectory dirInode = new INodeDirectory(inodeId.nextValue(), p, 0L);
     editLog.logMkDir(BASE_PATH, dirInode);
     long blockSize = 10;
     BlockInfo[] blocks = new BlockInfo[blocksPerFile];
     for (int iB = 0; iB < blocksPerFile; ++iB) {
       blocks[iB] = 
-       new BlockInfo(new Block(0, blockSize, BLOCK_GENERATION_STAMP),
-                               replication);
+          new BlockInfo(new Block(0, blockSize, BLOCK_GENERATION_STAMP),
+                                  replication);
+      blocks[iB].setChecksum(rng.nextInt(Integer.MAX_VALUE) + 1);
     }
     
     long currentBlockId = startingBlockId;
@@ -82,17 +90,17 @@ public class CreateEditsLog {
 
       try {
 
-        INodeFileUnderConstruction inode = new INodeFileUnderConstruction(
-                      null, replication, 0, blockSize, blocks, p, "", "", null);
         // Append path to filename with information about blockIDs 
         String path = "_" + iF + "_B" + blocks[0].getBlockId() + 
                       "_to_B" + blocks[blocksPerFile-1].getBlockId() + "_";
         String filePath = nameGenerator.getNextFileName("");
         filePath = filePath + path;
+        INodeFileUnderConstruction inode = new INodeFileUnderConstruction(
+            inodeId.nextValue(), null, replication, 0, blockSize, blocks, p, "", "", null);
         // Log the new sub directory in edits
         if ((iF % nameGenerator.getFilesPerDirectory())  == 0) {
           String currentDir = nameGenerator.getCurrentDir();
-          dirInode = new INodeDirectory(p, 0L);
+          dirInode = new INodeDirectory(inodeId.nextValue(), p, 0L);
           editLog.logMkDir(currentDir, dirInode);
         }
         editLog.logOpenFile(filePath, inode);
@@ -195,12 +203,12 @@ public class CreateEditsLog {
       }
     }
   
-    FSImage fsImage = new FSImage(new File(edits_dir));
+    Collection<URI> dirs = new ArrayList<URI>();
+    dirs.add(Util.stringAsURI(edits_dir));
+    FSImage fsImage = new FSImage(new Configuration(), dirs, dirs, null);
     FileNameGenerator nameGenerator = new FileNameGenerator(BASE_PATH, 100);
 
-
-    FSEditLog editLog = fsImage.getEditLog();
-    editLog.createEditLogFile(fsImage.getFsEditName());
+    FSEditLog editLog = FSImageTestUtil.createStandaloneEditLog(editsLogDir);
     editLog.open();
     addFiles(editLog, numFiles, replication, numBlocksPerFile, startingBlockId,
              nameGenerator);

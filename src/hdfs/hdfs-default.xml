@@ -16,6 +16,12 @@ creations/deletions), or "all".</description>
 </property>
 
 <property>
+  <name>dfs.access.time.touchable</name>
+  <value>true</value>
+  <description> This branch of HDFS supports touch changing file accessTime.</description>
+</property>
+
+<property>
   <name>dfs.secondary.http.address</name>
   <value>0.0.0.0:50090</value>
   <description>
@@ -146,6 +152,18 @@ creations/deletions), or "all".</description>
 </property>
 
 <property>
+  <name>dfs.name.dir.policy</name>
+  <value>0</value>
+  <description>Determines the DFS name node directory policy. 
+    0 - No enforcement
+    1 - Enforce that there should be at least two copies and they must be on 
+        different devices
+    2 - Enforce that there should be at least two copies on different devices
+        and at least one must be on an NFS device
+  </description>
+</property>
+
+<property>
   <name>dfs.name.dir</name>
   <value>${hadoop.tmp.dir}/dfs/name</value>
   <description>Determines where on the local filesystem the DFS name node
@@ -197,6 +215,17 @@ creations/deletions), or "all".</description>
   list of directories, then data will be stored in all named
   directories, typically on different devices.
   Directories that do not exist are ignored.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datadir.confpath</name>
+  <value></value>
+  <description>Determines where on the local filesystem on the DFS data node
+  to locate the config file with the list of working directories. This is an
+  absolute path to that file and the data is stored in a new line deliminated
+  file. This allows for a dynamic list of directories without modifying the 
+  actual config file itself.
   </description>
 </property>
 
@@ -323,6 +352,13 @@ creations/deletions), or "all".</description>
 </property> 
 
 <property>
+  <name>dfs.hosts.ignoremissing</name>
+  <value></value>
+  <description>Ignore missing include/exclude files.
+  </description>
+</property> 
+
+<property>
   <name>dfs.max.objects</name>
   <value>0</value>
   <description>The maximum number of files, directories and blocks
@@ -404,11 +440,63 @@ creations/deletions), or "all".</description>
 </property>
 
 <property>
-  <name>dfs.datanode.failed.volumes.tolerated</name>
-  <value>0</value>
-  <description>The number of volumes that are allowed to
-  fail before a datanode stops offering service. By default
-  any volume failure will cause a datanode to shutdown.
+  <name>dfs.fastcopy.file.wait_time</name>
+  <value>300000</value>
+  <description>The number of milliseconds FastCopy should wait for a file to be
+    completed.
+  </description>
+</property>
+
+<property>
+  <name>dfs.fastcopy.max.datanode.errors</name>
+  <value>5</value>
+  <description>The maximum number of datanode errors after which FastCopy will
+    stop scheduling block copy requests on that datanode. This prevents a bad
+    datanode from slowing down everyone.
+  </description>
+</property>
+
+<property>
+  <name>dfs.fastcopy.blockRPC.pool_size</name>
+  <value>5</value>
+  <description>This controls the maximum number of blocks (including replicas)
+    that the FastCopy client will copy concurrently per file. At times
+    dfs.replication.min is less than 3 and hence we can start copying
+    the next block before all 3 replicas of the first block are done.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.blkcopy.threads</name>
+  <value>10</value>
+  <description>This controls the maximum number of blocks that the datanode
+    shall copy concurrently.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.blkcopy.wait_time</name>
+  <value>300</value>
+  <description>The timeout in seconds for a block copy RPC request to the
+    datanode.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.blkcopy.hardlink</name>
+  <value>true</value>
+  <description>When a datanode performs a local block copy, whether or not to
+    hardlink the block files on disk.
+  </description>
+</property>
+
+<property>
+  <name>dfs.fastcopy.block.wait_time</name>
+  <value>300000</value>
+  <description>The amount of time in ms that the Fast Copy client should wait
+    for each block after the datanodes finish copying the block. This is to
+    account for the lag between the block being successfully copied on the
+    datanode and the block being reported to the namenode.
   </description>
 </property>
 
@@ -433,4 +521,95 @@ creations/deletions), or "all".</description>
   <value></value>
   <description>The name for a federated hdfs cluster</description>
 </property>
+
+<property>
+  <name>dfs.namemode.leasemanager.rpc.batchsize</name>
+  <value>1000</value>
+  <description>The size used for batching RPC calls that return many
+  values. Currently only used by iterativeGetOpenFiles()</description>
+</property>
+
+<property>
+  <name>dfs.client.tos.value</name>
+  <value>-1</value>
+  <description>The value of the IP_TOS option in socket, allowed values 
+  are from 0 to 191, inclusive</description>
+</property>
+
+<property>
+  <name>dfs.leaserecovery.discardlastblock.ifnosync</name>
+  <value>false</value>
+  <description>The flag indicating if namenode lease recovery could
+  discard a file's last block that has no synced data
+  </description>
+</property>
+
+<property>
+  <name>dfs.safemode.leave.threads</name>
+  <value>16</value>
+  <description>Maximum number of threads which will be used when exiting safemode.
+  </description>
+</property>
+
+<property>
+  <name>dfs.name.edits.dir.minimum</name>
+  <value>1</value>
+  <description>Minimum number of journals to sync transactions to.
+  If the number of streams is below the threshold, the NN will shut down.
+  </description>
+</property>
+
+<property>
+  <name>dfs.name.edits.dir.minimum.nonlocal</name>
+  <value>0</value>
+  <description>Minimum number of remote or shared journals to sync transactions to.
+  If the number of such streams is below the threshold, the NN will shut down.
+  </description>
+</property>
+
+<property>
+  <name>dfs.enableHftp</name>
+  <value>true</value>
+  <description>Whether {listPaths|data|fileChecksum} servlets should be loaded at name node startup
+  </description>
+</property>
+
+<property>
+  <name>dfs.client.shutdownhook.enable</name>
+  <value>true</value>
+  <description>If true, the HDFS FileSystem will register a shutdown hook
+    to close all file systems if a shutdown occurs.  This is the default.
+    Set this to false if your application is registering its own shutdown
+    hook; in this case, HDFS will not register one, so the application
+    shutdown should include calling FileSystem.closeAll().
+  </description>
+</property>
+
+<property>
+  <name>hdfs.raid.codec.json</name>
+    <value>[
+{
+"id" : "rs",
+"num_data_blocks" : 10,
+"num_parity_blocks" : 4,
+"stripe_chunk_size" : -1,
+"parity_repl" : 1,
+"min_source_repl" : 1,
+"erasure_code" : "org.apache.hadoop.raid.ReedSolomonCode",
+"description" : "ReedSolomonCode code"
+},
+{
+"id" : "xor",
+"num_data_blocks" : 10,
+"num_parity_blocks" : 1,
+"stripe_chunk_size" : -1,
+"parity_repl" : 2,
+"min_source_repl" : 2,
+"erasure_code" : "org.apache.hadoop.raid.XORCode",
+"description" : "XORCode code"
+}
+]</value>
+  <description>JSon string that contains all Raid codecs</description>
+</property>
+
 </configuration>

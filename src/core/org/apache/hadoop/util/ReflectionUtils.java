@@ -57,11 +57,25 @@ public class ReflectionUtils {
    * @param conf Configuration
    */
   public static void setConf(Object theObject, Configuration conf) {
+    setConf(theObject, conf, true);
+  }
+  
+  /**
+   * Check and set 'configuration' if necessary.
+   * 
+   * @param theObject object for which to set configuration
+   * @param conf Configuration
+   * @param supportJobConf whether needs to configure old jobConf in an older way
+   */
+  public static void setConf(Object theObject, Configuration conf,
+      boolean supportJobConf) {
     if (conf != null) {
       if (theObject instanceof Configurable) {
         ((Configurable) theObject).setConf(conf);
       }
-      setJobConf(theObject, conf);
+      if (supportJobConf) {
+        setJobConf(theObject, conf);
+      }
     }
   }
   
@@ -102,6 +116,19 @@ public class ReflectionUtils {
    */
   @SuppressWarnings("unchecked")
   public static <T> T newInstance(Class<T> theClass, Configuration conf) {
+    return newInstance(theClass, conf, true);
+  }
+
+  /** Create an object for the given class and initialize it from conf
+   * 
+   * @param theClass class of which an object is created
+   * @param conf Configuration
+   * @param supportJobConf whether needs to configure old jobConf in an older way
+   * @return a new object
+   */
+  @SuppressWarnings("unchecked")
+  public static <T> T newInstance(Class<T> theClass, Configuration conf,
+      boolean supportJobConf) {
     T result;
     try {
       Constructor<T> meth = (Constructor<T>) CONSTRUCTOR_CACHE.get(theClass);
@@ -114,8 +141,44 @@ public class ReflectionUtils {
     } catch (Exception e) {
       throw new RuntimeException(e);
     }
-    setConf(result, conf);
+    setConf(result, conf, supportJobConf);
     return result;
+  }
+
+  /**
+   * Create an object for the given class.
+   * 
+   * @param theClass
+   *          class of which an object is created
+   * 
+   * @param parameterTypes
+   *          an array of parameterTypes for the constructor
+   * @param initargs
+   *          the list of arguments for the constructor
+   * @return a new object
+   */
+  public static <T> T newInstance(Class<T> theClass, Class<?>[] parameterTypes,
+      Object[] initargs) {
+    // Perform some sanity checks on the arguments.
+    if (parameterTypes.length != initargs.length) {
+      throw new IllegalArgumentException(
+          "Constructor parameter types don't match constructor arguments");
+    }
+    for (int i = 0; i < parameterTypes.length; i++) {
+      Class<?> clazz = parameterTypes[i];
+      if (!(clazz.isInstance(initargs[i]))) {
+        throw new IllegalArgumentException("Object : " + initargs[i]
+            + " is not an instance of " + clazz);
+      }
+    }
+
+    try {
+      Constructor<T> meth = theClass.getDeclaredConstructor(parameterTypes);
+      meth.setAccessible(true);
+      return meth.newInstance(initargs);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
   }
 
   static private ThreadMXBean threadBean = 

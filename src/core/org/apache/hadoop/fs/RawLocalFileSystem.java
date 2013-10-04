@@ -21,11 +21,12 @@ package org.apache.hadoop.fs;
 import java.io.*;
 import java.net.URI;
 import java.nio.ByteBuffer;
-import java.nio.channels.FileLock;
 import java.util.*;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.permission.*;
+import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.util.DataChecksum;
 import org.apache.hadoop.util.Progressable;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Shell;
@@ -38,8 +39,12 @@ public class RawLocalFileSystem extends FileSystem {
   static final URI NAME = URI.create("file:///");
   private Path workingDir;
   
-  public RawLocalFileSystem() {
-    workingDir = new Path(System.getProperty("user.dir")).makeQualified(this);
+  public RawLocalFileSystem() throws IOException {
+    String userDir = System.getProperty("user.dir");
+    if (userDir == null || userDir.length() == 0) {
+      userDir = new File(".").getCanonicalPath();
+    }
+    workingDir = new Path(userDir).makeQualified(this);
   }
   
   /** Convert a path to a File. */
@@ -295,7 +300,7 @@ public class RawLocalFileSystem extends FileSystem {
     }
     return FileUtil.fullyDelete(f);
   }
- 
+
   public FileStatus[] listStatus(Path f) throws IOException {
     File localf = pathToFile(f);
     FileStatus[] results;
@@ -343,6 +348,18 @@ public class RawLocalFileSystem extends FileSystem {
     return new Path(System.getProperty("user.home")).makeQualified(this);
   }
 
+  @Override
+  public Path getHomeDirectory(String userName) throws IllegalArgumentException {
+    if (userName != null) {
+      LOG.warn("Home directory for non-default " +
+               "user not supported by RawLocalFilesystem");
+      throw new IllegalArgumentException(
+        "Home directory for non-default " +
+        "user not supported by RawLocalFilesystem");
+    }
+    return getHomeDirectory();
+  }
+
   /**
    * Set the working directory to the given directory.
    */
@@ -354,6 +371,28 @@ public class RawLocalFileSystem extends FileSystem {
   @Override
   public Path getWorkingDirectory() {
     return workingDir;
+  }
+  
+  /** {@inheritDoc} */
+  @Override
+  public int getFileCrc(Path f) throws IOException {
+    File p2f = pathToFile(f);
+    DataChecksum checksum = DataChecksum.newDataChecksum(DataChecksum.CHECKSUM_CRC32, 1);
+    byte[] buf = new byte[1024];
+    DataInputStream streamIn = new DataInputStream(new BufferedInputStream(
+        new FileInputStream(p2f), 128 * 1024));
+    try {
+      while (true) {
+        int bytesRead = streamIn.read(buf);
+        if (bytesRead == -1) {
+          break;
+        } else
+          checksum.update(buf, 0, bytesRead);
+      }
+      return (int) checksum.getValue();
+    } finally {
+      IOUtils.closeStream(streamIn);
+    }
   }
   
   // In the case of the local filesystem, we can just rename the file.

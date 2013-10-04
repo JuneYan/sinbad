@@ -36,6 +36,7 @@ import java.util.StringTokenizer;
 import java.util.Collection;
 
 import org.apache.hadoop.fs.*;
+import org.apache.log4j.LogManager;
 
 /**
  * General string utils
@@ -87,18 +88,18 @@ public class StringUtils {
   public static String humanReadableInt(long number) {
     long absNumber = Math.abs(number);
     double result = number;
-    String suffix = "";
+    String suffix = " B";
     if (absNumber < 1024) {
       // nothing
     } else if (absNumber < 1024 * 1024) {
       result = number / 1024.0;
-      suffix = "k";
+      suffix = " KB";
     } else if (absNumber < 1024 * 1024 * 1024) {
       result = number / (1024.0 * 1024);
-      suffix = "m";
+      suffix = " MB";
     } else {
       result = number / (1024.0 * 1024 * 1024);
-      suffix = "g";
+      suffix = " GB";
     }
     return oneDecimal.format(result) + suffix;
   }
@@ -366,7 +367,8 @@ public class StringUtils {
       String str, char separator) {
     // String.split returns a single empty result for splitting the empty
     // string.
-    if ("".equals(str)) {
+    final int len = str.length();
+    if (len == 0) {
       return new String[]{""};
     }
     ArrayList<String> strList = new ArrayList<String>();
@@ -376,7 +378,10 @@ public class StringUtils {
       strList.add(str.substring(startIndex, nextIndex));
       startIndex = nextIndex + 1;
     }
-    strList.add(str.substring(startIndex));
+    if(startIndex < len) {
+      // only add the last component if "/" is not the last character
+      strList.add(str.substring(startIndex));
+    }
     // remove trailing empty split(s)
     int last = strList.size(); // last split
     while (--last>=0 && "".equals(strList.get(last))) {
@@ -606,6 +611,7 @@ public class StringUtils {
       public void run() {
         LOG.info(toStartupShutdownString("SHUTDOWN_MSG: ", new String[]{
           "Shutting down " + classname + " at " + hostname}));
+        LogManager.shutdown();
       }
     });
   }
@@ -736,5 +742,22 @@ public class StringUtils {
 
   public static synchronized String limitDecimalTo2(double d) {
     return decimalFormat.format(d);
+  }
+
+  /**
+   * Get the stack trace of a given thread. Works by getting all stack traces
+   * and looking at the specified thread.
+   * @param t The thread.
+   * @return The newline-delimited stack trace as a single string.
+   */
+  public static String stackTraceOfThread(Thread t) {
+    StackTraceElement[] stackTraceElements = Thread.getAllStackTraces().get(t);
+    String stackTrace = "";
+    if (stackTraceElements != null) {
+      for (StackTraceElement stackTraceElement : stackTraceElements) {
+        stackTrace += stackTraceElement + "\n";
+      }
+    }
+    return stackTrace;
   }
 }

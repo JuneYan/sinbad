@@ -26,6 +26,7 @@ public enum EditsElement {
   EDITS_VERSION,
   RECORD,
   OPCODE,
+  TRANSACTION_ID,
   DATA,
     // elements in the data part of the editLog records
     LENGTH,
@@ -76,5 +77,8 @@ public enum EditsElement {
     KEY_EXPIRY_DATE,
     KEY_LENGTH,
     KEY_BLOB,
-    CHECKSUM
+    CHECKSUM,
+    OFFSET,
+    INODE_ID,
+    BLOCK_CHECKSUM
 }

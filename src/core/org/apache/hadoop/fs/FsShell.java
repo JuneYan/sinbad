@@ -31,6 +31,7 @@ import java.util.zip.GZIPInputStream;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.shell.CommandFormat;
 import org.apache.hadoop.fs.shell.Count;
 import org.apache.hadoop.io.DataInputBuffer;
@@ -43,6 +44,8 @@ import org.apache.hadoop.io.compress.CompressionCodec;
 import org.apache.hadoop.io.compress.CompressionCodecFactory;
 import org.apache.hadoop.ipc.RPC;
 import org.apache.hadoop.ipc.RemoteException;
+import org.apache.hadoop.util.DataTransferThrottler;
+import org.apache.hadoop.util.IOThrottler;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
@@ -63,7 +66,7 @@ public class FsShell extends Configured implements Tool {
   }
   static final String SETREP_SHORT_USAGE="-setrep [-R] [-w] <rep> <path/file ...>";
   static final int SETREP_MAX_PATHS = 1024;
-  static final String GET_SHORT_USAGE = "-get [-ignoreCrc] [-crc] <src> <localdst>";
+  static final String GET_SHORT_USAGE = "-get [-rate <bandwidth>] [-ignoreCrc] [-crc] [-gencrc] [-start offset] <src> <localdst>";
   static final String COPYTOLOCAL_SHORT_USAGE = GET_SHORT_USAGE.replace(
       "-get", "-copyToLocal");
   static final String HEAD_USAGE="-head <file>";
@@ -111,13 +114,14 @@ public class FsShell extends Configured implements Tool {
 
   public enum LsOption {
     Recursive,
-    WithBlockSize
+    WithBlockSize,
+    DirectoryOnly
   };
 
   /**
    * Copies from stdin to the indicated file.
    */
-  private void copyFromStdin(Path dst, FileSystem dstFs) throws IOException {
+  private void copyFromStdin(Path dst, FileSystem dstFs, IOThrottler throttler) throws IOException {
     if (dstFs.isDirectory(dst)) {
       throw new IOException("When source is stdin, destination must be a file.");
     }
@@ -126,7 +130,8 @@ public class FsShell extends Configured implements Tool {
     }
     FSDataOutputStream out = dstFs.create(dst);
     try {
-      IOUtils.copyBytes(System.in, out, getConf(), false);
+      IOUtils.copyBytes(System.in, out,
+          getConf().getInt("io.file.buffer.size", 4096), false, throttler);
     }
     finally {
       out.close();
@@ -134,11 +139,23 @@ public class FsShell extends Configured implements Tool {
   }
 
   /**
-   * Print from src to stdout.
+   * Print from src to stdout 
    */
   private void printToStdout(InputStream in) throws IOException {
     try {
       IOUtils.copyBytes(in, System.out, getConf(), false);
+    } finally {
+      in.close();
+    }
+  }
+  /**
+   * Print from src to stdout
+   * And print the checksum to stderr
+   */
+  private void printToStdoutAndCRCToStderr(InputStream in, Path file) throws IOException {
+    try {
+      long checksum = IOUtils.copyBytesAndGenerateCRC(in, System.out, getConf(), false);
+      FileUtil.printChecksumToStderr(checksum, file);
     } finally {
       in.close();
     }
@@ -148,13 +165,17 @@ public class FsShell extends Configured implements Tool {
   /**
    * Add local files to the indicated FileSystem name. src is kept.
    */
-  void copyFromLocal(Path[] srcs, String dstf) throws IOException {
+  void copyFromLocal(Path[] srcs, String dstf, boolean validate, IOThrottler throttler)
+  throws IOException {
     Path dstPath = new Path(dstf);
     FileSystem dstFs = dstPath.getFileSystem(getConf());
     if (srcs.length == 1 && srcs[0].toString().equals("-"))
-      copyFromStdin(dstPath, dstFs);
-    else
-      dstFs.copyFromLocalFile(false, false, srcs, dstPath);
+      copyFromStdin(dstPath, dstFs, throttler);
+    else {
+      FileUtil.copy(
+          FileSystem.getLocal(getConf()), srcs, dstFs, dstPath,
+          false, false, validate, getConf(), throttler);
+    }
   }
 
   /**
@@ -180,31 +201,40 @@ public class FsShell extends Configured implements Tool {
    * Otherwise, IOException is thrown.
    * @param argv: arguments
    * @param pos: Ignore everything before argv[pos]
+   * @param throttler: IOThrottler for copy
    * @exception: IOException
    * @see org.apache.hadoop.fs.FileSystem.globStatus
    */
-  void copyToLocal(String[]argv, int pos) throws IOException {
-    CommandFormat cf = new CommandFormat("copyToLocal", 2,2,"crc","ignoreCrc");
+  void copyToLocal(String[]argv, int pos, IOThrottler throttler) throws IOException {
+    CommandFormat cf = new CommandFormat("copyToLocal", 2,3,"crc","ignoreCrc", 
+        "gencrc", "validate", "start");
 
     String srcstr = null;
     String dststr = null;
+    long offset = 0L;
     try {
       List<String> parameters = cf.parse(argv, pos);
-      srcstr = parameters.get(0);
-      dststr = parameters.get(1);
+      int curPos = 0;
+      if (parameters.size() == 3) {
+        offset = Long.parseLong(parameters.get(curPos++));
+      }
+      srcstr = parameters.get(curPos++);
+      dststr = parameters.get(curPos++);
     }
     catch(IllegalArgumentException iae) {
       System.err.println("Usage: java FsShell " + GET_SHORT_USAGE);
       throw iae;
     }
     boolean copyCrc = cf.getOpt("crc");
+    final boolean genCrc = cf.getOpt("gencrc");
     final boolean verifyChecksum = !cf.getOpt("ignoreCrc");
+    final boolean validate = cf.getOpt("validate");
 
     if (dststr.equals("-")) {
       if (copyCrc) {
         System.err.println("-crc option is not valid when destination is stdout.");
       }
-      cat(srcstr, verifyChecksum);
+      cat(srcstr, verifyChecksum, genCrc, offset);
     } else {
       File dst = new File(dststr);
       Path srcpath = new Path(srcstr);
@@ -221,9 +251,8 @@ public class FsShell extends Configured implements Tool {
                               + "destination should be a directory.");
       }
       for (FileStatus status : srcs) {
-        Path p = status.getPath();
-        File f = dstIsDir? new File(dst, p.getName()): dst;
-        copyToLocal(srcFS, p, f, copyCrc);
+        File f = dstIsDir? new File(dst, status.getPath().getName()): dst;
+        copyToLocal(srcFS, status, f, copyCrc, genCrc, validate, offset, throttler);
       }
     }
   }
@@ -249,21 +278,26 @@ public class FsShell extends Configured implements Tool {
   /**
    * Copy a source file from a given file system to local destination.
    * @param srcFS source file system
-   * @param src source path
+   * @param srcStatus File status of source path
    * @param dst destination
    * @param copyCrc copy CRC files?
+   * @param generate CRC or not?
+   * @param validate validate copied destination against source
+   * @param offset start offset of the copying
    * @exception IOException If some IO failed
    */
-  private void copyToLocal(final FileSystem srcFS, final Path src,
-                           final File dst, final boolean copyCrc)
+  private void copyToLocal(final FileSystem srcFS, final FileStatus srcStatus,
+                           final File dst, final boolean copyCrc,
+                           final boolean genCrc, final boolean validate,
+                           long offset, IOThrottler throttler)
     throws IOException {
     /* Keep the structure similar to ChecksumFileSystem.copyToLocal().
      * Ideal these two should just invoke FileUtil.copy() and not repeat
      * recursion here. Of course, copy() should support two more options :
      * copyCrc and useTmpFile (may be useTmpFile need not be an option).
      */
-
-    if (!srcFS.getFileStatus(src).isDir()) {
+    Path src = srcStatus.getPath();
+    if (!srcStatus.isDir()) {
       if (dst.exists()) {
         // match the error message in FileUtil.checkDest():
         throw new IOException("Target " + dst + " already exists");
@@ -272,7 +306,8 @@ public class FsShell extends Configured implements Tool {
       // use absolute name so that tmp file is always created under dest dir
       File tmp = FileUtil.createLocalTempFile(dst.getAbsoluteFile(),
                                               COPYTOLOCAL_PREFIX, true);
-      if (!FileUtil.copy(srcFS, src, tmp, false, srcFS.getConf())) {
+      if (!FileUtil.copy(srcFS, src, tmp, false, validate, srcFS.getConf(),
+          genCrc, offset, throttler)) {
         throw new IOException("Failed to copy " + src + " to " + dst);
       }
 
@@ -280,7 +315,7 @@ public class FsShell extends Configured implements Tool {
         throw new IOException("Failed to rename tmp file " + tmp +
                               " to local destination \"" + dst + "\".");
       }
-
+      
       if (copyCrc) {
         if (!(srcFS instanceof ChecksumFileSystem)) {
           throw new IOException("Source file system does not have crc files");
@@ -289,15 +324,16 @@ public class FsShell extends Configured implements Tool {
         ChecksumFileSystem csfs = (ChecksumFileSystem) srcFS;
         File dstcs = FileSystem.getLocal(srcFS.getConf())
           .pathToFile(csfs.getChecksumFile(new Path(dst.getCanonicalPath())));
-        copyToLocal(csfs.getRawFileSystem(), csfs.getChecksumFile(src),
-                    dstcs, false);
+        copyToLocal(csfs.getRawFileSystem(), csfs.getFileStatus(
+            csfs.getChecksumFile(src)), dstcs, false, genCrc, validate, offset, throttler);
       }
     } else {
       // once FileUtil.copy() supports tmp file, we don't need to mkdirs().
       dst.mkdirs();
       for(FileStatus path : srcFS.listStatus(src)) {
-        copyToLocal(srcFS, path.getPath(),
-                    new File(dst, path.getPath().getName()), copyCrc);
+        copyToLocal(srcFS, path,
+                    new File(dst, path.getPath().getName()), copyCrc,
+                    genCrc, validate, offset, throttler);
       }
     }
   }
@@ -360,7 +396,8 @@ public class FsShell extends Configured implements Tool {
    * @exception: IOException
    * @see org.apache.hadoop.fs.FileSystem.globStatus
    */
-  void cat(String src, boolean verifyChecksum) throws IOException {
+  void cat(String src, boolean verifyChecksum, final boolean genCrc,
+      final long offset) throws IOException {
     //cat behavior in Linux
     //  [~/1207]$ ls ?.txt
     //  x.txt  z.txt
@@ -376,7 +413,21 @@ public class FsShell extends Configured implements Tool {
         if (srcFs.getFileStatus(p).isDir()) {
           throw new IOException("Source must be a file.");
         }
-        printToStdout(srcFs.open(p));
+        FSDataInputStream is = srcFs.open(p);
+        long newOffset = offset;
+        if (newOffset < 0) {
+          if (is.isUnderConstruction()) {
+            throw new IOException("Couldn't copy under-construction file with " +
+                "negative offset " + newOffset);
+          }
+          newOffset += srcFs.getFileStatus(p).getLen();
+        }
+        is.seek(newOffset);
+        if (genCrc) {
+          printToStdoutAndCRCToStderr(is, p);
+        } else {
+          printToStdout(is);
+        }
       }
     }.globAndProcess(srcPattern, getSrcFileSystem(srcPattern, verifyChecksum));
   }
@@ -389,8 +440,8 @@ public class FsShell extends Configured implements Tool {
     DataInputBuffer inbuf;
     DataOutputBuffer outbuf;
 
-    public TextRecordInputStream(FileStatus f) throws IOException {
-      r = new SequenceFile.Reader(getFS(), f.getPath(), getConf());
+    public TextRecordInputStream(FileSystem fs, FileStatus f) throws IOException {
+      r = new SequenceFile.Reader(fs, f.getPath(), getConf());
       key = ReflectionUtils.newInstance(r.getKeyClass().asSubclass(WritableComparable.class),
                                         getConf());
       val = ReflectionUtils.newInstance(r.getValueClass().asSubclass(Writable.class),
@@ -428,7 +479,7 @@ public class FsShell extends Configured implements Tool {
       case 0x5345: // 'S' 'E'
         if (i.readByte() == 'Q') {
           i.close();
-          return new TextRecordInputStream(srcFs.getFileStatus(p));
+          return new TextRecordInputStream(srcFs, srcFs.getFileStatus(p));
         }
         break;
     }
@@ -471,6 +522,13 @@ public class FsShell extends Configured implements Tool {
       }
     }.globAndProcess(srcPattern, srcPattern.getFileSystem(getConf()));
   }
+  
+  void getFileCrc(String src) throws IOException {
+    Path f = new Path(src);
+    FileSystem srcFs = f.getFileSystem(getConf());
+    System.out.println(srcFs.getFileCrc(f));
+  }
+
 
   /**
    * Parse the incoming command string
@@ -524,11 +582,12 @@ public class FsShell extends Configured implements Tool {
       System.out.flush();
 
       boolean printWarning = false;
-      FileStatus status = getFS().getFileStatus(f);
+      FileSystem fs = f.getFileSystem(getConf());
+      FileStatus status = fs.getFileStatus(f);
       long len = status.getLen();
 
       for(boolean done = false; !done; ) {
-        BlockLocation[] locations = getFS().getFileBlockLocations(status, 0, len);
+        BlockLocation[] locations = fs.getFileBlockLocations(status, 0, len);
         int i = 0;
         for(; i < locations.length &&
           locations[i].getHosts().length == rep; i++)
@@ -647,8 +706,15 @@ public class FsShell extends Configured implements Tool {
       boolean printHeader) throws IOException {
     final boolean recursive = flags.contains(LsOption.Recursive);
     final boolean withBlockSize = flags.contains(LsOption.WithBlockSize);
-    final String cmd = recursive? "lsr": "ls";
-    final FileStatus[] items = shellListStatus(cmd, srcFs, src);
+    final boolean directoryOnly = flags.contains(LsOption.DirectoryOnly);
+    String cmd = "ls";
+    if (recursive) {
+      cmd = "lsr";
+    }
+    if (directoryOnly) {
+      cmd = "ls -d";
+    }
+    final FileStatus[] items = shellListStatus(cmd, srcFs, src, directoryOnly);
     if (items == null) {
       return 1;
     } else {
@@ -755,6 +821,21 @@ public class FsShell extends Configured implements Tool {
       String pathStr = status[i].getPath().toString();
       System.out.println(("".equals(pathStr)?".":pathStr) + "\t" + totalSize);
     }
+  }
+
+  /*
+   * Remove the given dir pattern if it is empty
+   */
+  void rmdir(String src, final boolean ignoreFailOnEmpty,
+              final boolean skipTrash) throws IOException {
+    Path fPattern = new Path(src);
+    new DelayedExceptionThrowing() {
+      @Override
+      void process(Path p, FileSystem srcFs) throws IOException {
+        DeleteUtils.delete(getConf(), p, srcFs, false, true, ignoreFailOnEmpty,
+            false);
+      }
+    }.globAndProcess(fPattern, fPattern.getFileSystem(getConf()));
   }
 
   /**
@@ -1014,6 +1095,25 @@ public class FsShell extends Configured implements Tool {
     }
   }
 
+  private int hardlink(String argv[]) throws IOException {
+    if (argv.length != 3) {
+      throw new IllegalArgumentException(
+          "Must specify exactly two files to hardlink");
+    }
+    if (argv[1] == null || argv[2] == null) {
+      throw new IllegalArgumentException("One of the arguments is null");
+    }
+    Path src = new Path(argv[1]);
+    Path dst = new Path(argv[2]);
+    FileSystem srcFs = src.getFileSystem(getConf());
+    FileSystem dstFs = dst.getFileSystem(getConf());
+    if (!srcFs.getUri().equals(dstFs.getUri())) {
+      throw new IllegalArgumentException("Source and Destination files are" +
+        " on different filesystems");
+    }
+    return (srcFs.hardLink(src, dst)) ? 0 : -1;
+  }
+
   /**
    * Copy file(s) to a destination file. Multiple source
    * files can be specified. The destination is the last element of
@@ -1033,7 +1133,7 @@ public class FsShell extends Configured implements Tool {
     //
     if (argv.length > 3) {
       Path dst = new Path(dest);
-      if (!getFS().isDirectory(dst)) {
+      if (!dst.getFileSystem(conf).isDirectory(dst)) {
         throw new IOException("When copying multiple files, " 
                               + "destination " + dest + " should be a directory.");
       }
@@ -1129,52 +1229,29 @@ public class FsShell extends Configured implements Tool {
     new DelayedExceptionThrowing() {
       @Override
       void process(Path p, FileSystem srcFs) throws IOException {
-        delete(p, srcFs, recursive, skipTrash);
+        DeleteUtils.delete(getConf(), p, srcFs, recursive, skipTrash, false,
+            true);
       }
     }.globAndProcess(srcPattern, srcPattern.getFileSystem(getConf()));
   }
 
-  /* delete a file */
-  public void delete(Path src, FileSystem srcFs, boolean recursive,
-                      boolean skipTrash) throws IOException {
-    FileStatus fs = null;
-    try {
-      fs = srcFs.getFileStatus(src);
-    } catch (FileNotFoundException fnfe) {
-      // Have to re-throw so that console output is as expected
-      throw new FileNotFoundException("cannot remove "
-          + src + ": No such file or directory.");
-    }
 
-    if (fs.isDir() && !recursive) {
-      throw new IOException("Cannot remove directory \"" + src +
-                            "\", use -rmr instead");
-    }
-
-    if(!skipTrash) {
-      try {
-	      Trash trashTmp = new Trash(srcFs, getConf());
-        if (trashTmp.moveToTrash(src)) {
-          System.err.println("Moved to trash: " + src);
-          return;
-        }
-      } catch (IOException e) {
-        Exception cause = (Exception) e.getCause();
-        String msg = "";
-        if(cause != null) {
-          msg = cause.getLocalizedMessage();
-        }
-        System.err.println("Problem with Trash." + msg +". Consider using -skipTrash option");
-        throw e;
-      }
-    }
-
-    if (srcFs.delete(src, true)) {
-      System.err.println("Deleted " + src);
-    } else {
-      throw new IOException("Delete failed " + src);
-    }
+  /** Undelete a file
+   * @param src path to the file in the trash
+   * @param srcFs FileSystem instance
+   * @param userName name of the user whose trash will be searched, or
+   * null for current user
+   * @return true if the file was deleted
+   * @throws IOException
+   */
+  public boolean undelete(String src, FileSystem srcFs, String userName)
+    throws IOException {
+    boolean result = srcFs.undelete(new Path(src), userName);
+    if (result)
+      System.err.println("Moved from trash: " + src);
+    return result;
   }
+
   private void expunge() throws IOException {
     getTrash().expunge();
     getTrash().checkpoint();
@@ -1284,7 +1361,7 @@ public class FsShell extends Configured implements Tool {
     boolean okToContinue() { return okToContinue; }
     String getName() { return cmdName; }
 
-    protected CmdHandler(String cmdName, FileSystem fs) {
+    protected CmdHandler(String cmdName) {
       this.cmdName = cmdName;
     }
 
@@ -1294,8 +1371,9 @@ public class FsShell extends Configured implements Tool {
   /** helper returns listStatus() */
   private static FileStatus[] shellListStatus(String cmd,
                                                    FileSystem srcFs,
-                                                   FileStatus src) {
-    if (!src.isDir()) {
+                                                   FileStatus src,
+                                                   boolean directoryOnly) {
+    if (!src.isDir() || (src.isDir() && directoryOnly)) {
       FileStatus[] files = { src };
       return files;
     }
@@ -1326,7 +1404,7 @@ public class FsShell extends Configured implements Tool {
     int errors = 0;
     handler.run(stat, srcFs);
     if (recursive && stat.isDir() && handler.okToContinue()) {
-      FileStatus[] files = shellListStatus(handler.getName(), srcFs, stat);
+      FileStatus[] files = shellListStatus(handler.getName(), srcFs, stat, false);
       if (files == null) {
         return 1;
       }
@@ -1393,15 +1471,20 @@ public class FsShell extends Configured implements Tool {
       "hadoop fs [-fs <local | file system URI>] [-conf <configuration file>]\n\t" +
       "[-D <property=value>] [-ls <path>] [-lsr <path>] [-lsrx <path>] [-du <path>]\n\t" +
       "[-dus <path>] [-mv <src> <dst>] [-cp <src> <dst>] [-rm [-skipTrash] <src>]\n\t" +
-      "[-rmr [-skipTrash] <src>] [-put <localsrc> ... <dst>] [-copyFromLocal <localsrc> ... <dst>]\n\t" +
+      "[-rmr [-skipTrash] <src>] [-put <localsrc> ... <dst>]\n\t" +
+      "[-rmdir [-ignore-fail-on-non-empty] <src>]\n\t" + 
+      "[-copyFromLocal <localsrc> ... <dst>]\n\t" +
       "[-moveFromLocal <localsrc> ... <dst>] [" +
       GET_SHORT_USAGE + "\n\t" +
       "[-getmerge <src> <localdst> [addnl]] [-cat <src>]\n\t" +
       "[" + COPYTOLOCAL_SHORT_USAGE + "] [-moveToLocal <src> <localdst>]\n\t" +
       "[-mkdir <path>] [-report] [" + SETREP_SHORT_USAGE + "]\n\t" +
-      "[-touchz <path>] [-test -[ezd] <path>] [-stat [format] <path>]\n\t" +
+      "[-touchz <path>] [" + FsShellTouch.TOUCH_USAGE + "]\n\t" +
+      "[-test -[ezd] <path>] [-stat [format] <path>]\n\t" +
       "[-head <path>] [-tail [-f] <path>] [-text <path>]\n\t" +
       "[-decompress <path>] [-compress <src> <tgt>]\n\t" +
+      "[-undelete [-u <username>] <path>]\n\t" +
+      "[-filecrc <path>]\n\t" +
       "[" + FsShellPermissions.CHMOD_USAGE + "]\n\t" +
       "[" + FsShellPermissions.CHOWN_USAGE + "]\n\t" +
       "[" + FsShellPermissions.CHGRP_USAGE + "]\n\t" +
@@ -1424,14 +1507,15 @@ public class FsShell extends Configured implements Tool {
       "\t\targument must be specified. \n";
 
 
-    String ls = "-ls <path>: \tList the contents that match the specified file pattern. If\n" +
+    String ls = "-ls [-d] <path>: \tList the contents that match the specified file pattern. If\n" +
       "\t\tpath is not specified, the contents of /user/<currentUser>\n" +
       "\t\twill be listed. Directory entries are of the form \n" +
       "\t\t\tdirName (full path) <dir> \n" +
       "\t\tand file entries are of the form \n" +
       "\t\t\tfileName(full path) <r n> size \n" +
       "\t\twhere n is the number of replicas specified for the file \n" +
-      "\t\tand size is the size of the file, in bytes.\n";
+      "\t\tand size is the size of the file, in bytes.\n" +
+      "\t\t-d \tList directory entries instead of contents.\n";
 
     String lsr = "-lsr <path>: \tRecursively list the contents that match the specified\n" +
       "\t\tfile pattern.  Behaves very similarly to hadoop fs -ls,\n" +
@@ -1462,6 +1546,12 @@ public class FsShell extends Configured implements Tool {
       "\t\tdestination.  When copying multiple files, the destination\n" +
       "\t\tmust be a directory. \n";
 
+    String hardlink = "-hardlink <src> <dst> : Hardlink a source file to a "
+        + "destination file. The destination file must not exist";
+
+    String showlinks = "-showlinks <srcs...> : Displays the files hardlinked "
+        + "to each of the files specified on the command line";
+
     String rm = "-rm [-skipTrash] <src>: \tDelete all files that match the specified file pattern.\n" +
       "\t\tEquivalent to the Unix command \"rm <src>\"\n" +
       "\t\t-skipTrash option bypasses trash, if enabled, and immediately\n" +
@@ -1472,8 +1562,13 @@ public class FsShell extends Configured implements Tool {
       "\t\t-skipTrash option bypasses trash, if enabled, and immediately\n" +
       "deletes <src>";
 
+    String rmdir = "-rmdir [-ignore-fail-on-non-empty] <src>: \tRemoves the directory entry \n" +
+      "\t\tspecified by the directory argument, provided it is empty. \n";
+
     String put = "-put <localsrc> ... <dst>: \tCopy files " +
-    "from the local file system \n\t\tinto fs. \n";
+    "from the local file system \n\t\tinto fs. \n" +
+    "\t\twhen -rate is given, the upload bandwidth will not go beyond" +
+    " the sepcified <bandwidth> MB/s\n";
 
     String copyFromLocal = "-copyFromLocal <localsrc> ... <dst>:" +
     " Identical to the -put command.\n";
@@ -1484,7 +1579,13 @@ public class FsShell extends Configured implements Tool {
     String get = GET_SHORT_USAGE
       + ":  Copy files that match the file pattern <src> \n" +
       "\t\tto the local name.  <src> is kept.  When copying mutiple, \n" +
-      "\t\tfiles, the destination must be a directory. \n";
+      "\t\tfiles, the destination must be a directory. " +
+      "\t\twhen -rate is given, the download bandwidth will not go beyond" +
+      " the sepcified <bandwidth> MB/s\n" + 
+      "\t\twhen -gencrc is given, it will print out CRC32 checksum of the file in stderr\n" + 
+      "\t\twhen -start offset is given, it will first seek to given offset\n" + 
+      "\t\tand start reading from there; offset could be negative, for example, -1 means\n" +
+      "\t\tstarting from fileLen - 1\n";
 
     String getmerge = "-getmerge <src> <localdst>:  Get all the files in the directories that \n" +
       "\t\tmatch the source file pattern and merge and sort them to only\n" +
@@ -1503,6 +1604,12 @@ public class FsShell extends Configured implements Tool {
     String compress = "-compress <src> <tgt>: \tTakes a source file and compress the file to target.\n" +
     "\t\tThe compression codec is determined by the target file name extension.";
 
+    String filecrc = "-filecrc <src>: \treturn CRC32 value of the file.\n";
+    
+    String undelete = "-undelete [-u <username>] <src>: \tUndelete a file from the trash folder\n" +
+      "\t\tIf -u <username> is supplied, attempt to undelete from given users\n" +
+      "\t\ttrash, otherwise use current users trash as default\n";
+
     String copyToLocal = COPYTOLOCAL_SHORT_USAGE
                          + ":  Identical to the -get command.\n";
 
@@ -1517,6 +1624,18 @@ public class FsShell extends Configured implements Tool {
 
     String touchz = "-touchz <path>: Write a timestamp in yyyy-MM-dd HH:mm:ss format\n" +
       "\t\tin a file at <path>. An error is returned if the file exists with non-zero length\n";
+
+    String touch = FsShellTouch.TOUCH_USAGE + "\n" +
+      "\t\tUpdate the access and modification times of each PATH to the current time.\n" +
+      "\t\tIf PATH does not exist, create empty file.\n\n" +
+      "\t-a\tChange only access time\n" +
+      "\t-c, --no-create\n" +
+      "\t\tDo not create any files\n" +
+      "\t-d, --date=\"yyyy-MM-dd HH:mm:ss\"\n" +
+      "\t\tUse specified date instead of current time\n" +
+      "\t-m\tChange only modification time\n" + 
+      "\t-u timestamp\n" + 
+      "\t\tUse specified timestamp instead of date";
 
     String test = "-test -[ezd] <path>: If file { exists, has zero length, is a directory\n" +
       "\t\tthen return 0, else return 1.\n";
@@ -1584,8 +1703,14 @@ public class FsShell extends Configured implements Tool {
       System.out.println(dus);
     } else if ("rm".equals(cmd)) {
       System.out.println(rm);
+    } else if ("hardlink".equals(cmd)) {
+      System.out.println(hardlink);
+    } else if ("showlinks".equals(cmd)) {
+      System.out.println(showlinks);
     } else if ("rmr".equals(cmd)) {
       System.out.println(rmr);
+    } else if ("rmdir".equals(cmd)) {
+      System.out.println(rmdir);
     } else if ("mkdir".equals(cmd)) {
       System.out.println(mkdir);
     } else if ("mv".equals(cmd)) {
@@ -1614,6 +1739,8 @@ public class FsShell extends Configured implements Tool {
       System.out.println(setrep);
     } else if ("touchz".equals(cmd)) {
       System.out.println(touchz);
+    } else if ("touch".equals(cmd)) {
+      System.out.println(touch);
     } else if ("test".equals(cmd)) {
       System.out.println(test);
     } else if ("text".equals(cmd)) {
@@ -1634,6 +1761,12 @@ public class FsShell extends Configured implements Tool {
       System.out.println(chown);
     } else if ("chgrp".equals(cmd)) {
       System.out.println(chgrp);
+    } else if ("filecrc".equals(cmd)) {
+      System.out.println(filecrc);
+    } else if ("undelete".equals(cmd)) {
+      System.out.println(undelete);
+    } else if ("hardlink".equals(cmd)) {
+      System.out.println(undelete);
     } else if (Count.matches(cmd)) {
       System.out.println(Count.DESCRIPTION);
     } else if ("help".equals(cmd)) {
@@ -1650,6 +1783,7 @@ public class FsShell extends Configured implements Tool {
       System.out.println(cp);
       System.out.println(rm);
       System.out.println(rmr);
+      System.out.println(rmdir);
       System.out.println(put);
       System.out.println(copyFromLocal);
       System.out.println(moveFromLocal);
@@ -1663,9 +1797,12 @@ public class FsShell extends Configured implements Tool {
       System.out.println(head);
       System.out.println(tail);
       System.out.println(touchz);
+      System.out.println(touch);
       System.out.println(test);
       System.out.println(text);
       System.out.println(decompress);
+      System.out.println(filecrc);
+      System.out.println(undelete);
       System.out.println(compress);
       System.out.println(stat);
       System.out.println(chmod);
@@ -1678,6 +1815,17 @@ public class FsShell extends Configured implements Tool {
 
   }
 
+  private void showlinks(String src) throws IOException {
+    Path srcPath = new Path(src);
+    String[] files = srcPath.getFileSystem(getConf()).getHardLinkedFiles(
+        srcPath);
+    System.out.println("The following files (" + files.length
+        + ") are hardlinked to " + src + " : ");
+    for (String file : files) {
+      System.out.println(file);
+    }
+  }
+
   /**
    * Apply operation specified by 'cmd' on all parameters
    * starting from argv[startindex].
@@ -1686,12 +1834,28 @@ public class FsShell extends Configured implements Tool {
     int exitCode = 0;
     int i = startindex;
     boolean rmSkipTrash = false;
+    boolean rmdirIgnoreFail = false;
+    boolean lsDirOnly = false;
 
     // Check for -skipTrash option in rm/rmr
     if(("-rm".equals(cmd) || "-rmr".equals(cmd))
         && "-skipTrash".equals(argv[i])) {
       rmSkipTrash = true;
       i++;
+    }
+
+    if ("-rmdir".equals(cmd) && "-ignore-fail-on-non-empty".equals(argv[i])) {
+      rmdirIgnoreFail = true;
+      i++;  
+    }
+
+    // fs -ls -d
+    // having d in its option list
+    if ("-ls".equals(cmd) &&
+        argv[i].startsWith("-") &&
+        argv[i].contains("d")) {
+      lsDirOnly = true;
+      i++;  
     }
 
     //
@@ -1703,13 +1867,17 @@ public class FsShell extends Configured implements Tool {
         // issue the command to the fs
         //
         if ("-cat".equals(cmd)) {
-          cat(argv[i], true);
+          cat(argv[i], true, false, 0L);
         } else if ("-mkdir".equals(cmd)) {
           mkdir(argv[i]);
         } else if ("-rm".equals(cmd)) {
           delete(argv[i], false, rmSkipTrash);
+        } else if ("-showlinks".equals(cmd)) {
+          showlinks(argv[i]);
         } else if ("-rmr".equals(cmd)) {
           delete(argv[i], true, rmSkipTrash);
+        } else if ("-rmdir".equals(cmd)) {
+          rmdir(argv[i], rmdirIgnoreFail, rmSkipTrash);
         } else if ("-du".equals(cmd)) {
           du(argv[i]);
         } else if ("-dus".equals(cmd)) {
@@ -1717,7 +1885,12 @@ public class FsShell extends Configured implements Tool {
         } else if (Count.matches(cmd)) {
           new Count(argv, i, getConf()).runAll();
         } else if ("-ls".equals(cmd)) {
-          exitCode = ls(argv[i], EnumSet.noneOf(LsOption.class));
+          if (lsDirOnly) {
+            exitCode = ls(argv[i],
+                EnumSet.of(LsOption.DirectoryOnly));
+          } else {
+            exitCode = ls(argv[i], EnumSet.noneOf(LsOption.class));
+          }
         } else if ("-lsr".equals(cmd)) {
           exitCode = ls(argv[i], EnumSet.of(LsOption.Recursive));
         } else if ("-lsrx".equals(cmd)) {
@@ -1729,6 +1902,21 @@ public class FsShell extends Configured implements Tool {
           text(argv[i]);
         } else if ("-decompress".equals(cmd)) {
           decompress(argv[i]);
+        } else if ("-filecrc".equals(cmd)) {
+          getFileCrc(argv[i]);
+        } else if ("-undelete".equals(cmd)) {
+          String userName = null;
+          if ("-u".equals(argv[i])) {
+            // make sure there's at least one file path specified
+            if (argv.length < i+1) {
+              printUsage(cmd);
+              return -1;
+            }
+            i++;
+            userName = argv[i++];
+          }
+          exitCode = undelete(argv[i],
+              new Path(argv[i]).getFileSystem(getConf()), userName) ? 0 : -1;
         }
       } catch (RemoteException e) {
         //
@@ -1787,7 +1975,11 @@ public class FsShell extends Configured implements Tool {
     } else if ("-rm".equals(cmd) || "-rmr".equals(cmd)) {
       System.err.println("Usage: java FsShell [" + cmd +
                            " [-skipTrash] <src>]");
-    } else if ("-mv".equals(cmd) || "-cp".equals(cmd) || "-compress".equals(cmd)) {
+    } else if ("-rmdir".equals(cmd)) {
+      System.err.println("Usage: java FsShell [" + cmd + 
+                           " [-ignore-fail-on-non-empty] <src>]");
+    } else if ("-mv".equals(cmd) || "-cp".equals(cmd)
+        || "-compress".equals(cmd) || "-hardlink".equals(cmd)) {
       System.err.println("Usage: java FsShell" +
                          " [" + cmd + " <src> <dst>]");
     } else if ("-put".equals(cmd) || "-copyFromLocal".equals(cmd) ||
@@ -1804,6 +1996,8 @@ public class FsShell extends Configured implements Tool {
     } else if ("-cat".equals(cmd)) {
       System.err.println("Usage: java FsShell" +
                          " [" + cmd + " <src>]");
+    } else if ("-showlinks".equals(cmd)) {
+      System.err.println("Usage: java FsShell" + " [" + cmd + " <srcs...>]");
     } else if ("-setrep".equals(cmd)) {
       System.err.println("Usage: java FsShell [" + SETREP_SHORT_USAGE + "]");
     } else if ("-test".equals(cmd)) {
@@ -1816,6 +2010,8 @@ public class FsShell extends Configured implements Tool {
       System.err.println("Usage: java FsShell [" + HEAD_USAGE + "]");
     } else if ("-tail".equals(cmd)) {
       System.err.println("Usage: java FsShell [" + TAIL_USAGE + "]");
+    } else if ("-touch".equals(cmd)) {
+      System.err.println("Usage: java FsShell [" + FsShellTouch.TOUCH_USAGE + "]");
     } else {
       System.err.println("Usage: java FsShell");
       System.err.println("           [-ls <path>]");
@@ -1826,11 +2022,17 @@ public class FsShell extends Configured implements Tool {
       System.err.println("           [" + Count.USAGE + "]");
       System.err.println("           [-mv <src> <dst>]");
       System.err.println("           [-cp <src> <dst>]");
+      System.err.println("           [-hardlink <src> <dst>]");
+      System.err.println("           [-showlinks <srcs ..>] shows the files "
+          + "hardlinked to the given file");
       System.err.println("           [-rm [-skipTrash] <path>]");
       System.err.println("           [-rmr [-skipTrash] <path>]");
+      System.err.println("           [-rmdir [-ignore-fail-on-non-empty] <path>]");
       System.err.println("           [-expunge]");
-      System.err.println("           [-put <localsrc> ... <dst>]");
-      System.err.println("           [-copyFromLocal <localsrc> ... <dst>]");
+      System.err.println("           [-put [-validate] [-rate <bandwidth>] "
+          + "<localsrc> ... <dst>]");
+      System.err.println("           [-copyFromLocal [-validate] [-rate <bandwidth>] "
+          + "<localsrc> ... <dst>]");
       System.err.println("           [-moveFromLocal <localsrc> ... <dst>]");
       System.err.println("           [" + GET_SHORT_USAGE + "]");
       System.err.println("           [-getmerge <src> <localdst> [addnl]]");
@@ -1838,11 +2040,14 @@ public class FsShell extends Configured implements Tool {
       System.err.println("           [-text <src>]");
       System.err.println("           [-decompress <src>]");
       System.err.println("           [-compress <src> <tgt>]");
+      System.err.println("           [-undelete [-u <username>] <src>]");
       System.err.println("           [" + COPYTOLOCAL_SHORT_USAGE + "]");
-      System.err.println("           [-moveToLocal [-crc] <src> <localdst>]");
+      System.err.println("           [-moveToLocal [-rate <bandwidth>] [-crc] "
+          + "<src> <localdst>]");
       System.err.println("           [-mkdir <path>]");
       System.err.println("           [" + SETREP_SHORT_USAGE + "]");
       System.err.println("           [-touchz <path>]");
+      System.err.println("           [" + FsShellTouch.TOUCH_USAGE + "]");
       System.err.println("           [-test -[ezd] <path>]");
       System.err.println("           [-stat [format] <path>]");
       System.err.println("           [" + HEAD_USAGE + "]");
@@ -1885,15 +2090,18 @@ public class FsShell extends Configured implements Tool {
         printUsage(cmd);
         return exitCode;
       }
-    } else if ("-mv".equals(cmd) || "-cp".equals(cmd) || "-compress".equals(cmd)) {
+    } else if ("-mv".equals(cmd) || "-cp".equals(cmd)
+        || "-compress".equals(cmd) || "-hardlink".equals(cmd)) {
       if (argv.length < 3) {
         printUsage(cmd);
         return exitCode;
       }
     } else if ("-rm".equals(cmd) || "-rmr".equals(cmd) ||
-               "-cat".equals(cmd) || "-mkdir".equals(cmd) ||
-               "-touchz".equals(cmd) || "-stat".equals(cmd) ||
-               "-text".equals(cmd) || "-decompress".equals(cmd)) {
+               "-rmdir".equals(cmd) || "-cat".equals(cmd) ||
+               "-mkdir".equals(cmd) || "-touchz".equals(cmd) ||
+               "-stat".equals(cmd) || "-text".equals(cmd) ||
+               "-decompress".equals(cmd) || "-touch".equals(cmd) ||
+               "-undelete".equals(cmd) || "-showlinks".equals(cmd)) {
       if (argv.length < 2) {
         printUsage(cmd);
         return exitCode;
@@ -1915,17 +2123,48 @@ public class FsShell extends Configured implements Tool {
     exitCode = 0;
     try {
       if ("-put".equals(cmd) || "-copyFromLocal".equals(cmd)) {
-        Path[] srcs = new Path[argv.length-2];
+        boolean validate = false;
+        long rate = -1L;
+        if (argv[i].equals("-validate")) {
+          validate = true;
+          i++;
+        }
+        if (argv[i].equals("-rate")) {
+          i++;
+          rate = Long.parseLong(argv[i]);
+          if (rate <= 0L) {
+            throw new IllegalArgumentException(
+                "IO Throttler bandwidth must be positive. The input rate is invalid: " +
+                rate);
+          }
+          i++;
+        }
+        Path[] srcs = new Path[argv.length-1-i];
         for (int j=0 ; i < argv.length-1 ;)
           srcs[j++] = new Path(argv[i++]);
-        copyFromLocal(srcs, argv[i++]);
+        DataTransferThrottler throttler =
+          rate > 0L ? new DataTransferThrottler(rate) : null;
+        copyFromLocal(srcs, argv[i++], validate, throttler);
       } else if ("-moveFromLocal".equals(cmd)) {
         Path[] srcs = new Path[argv.length-2];
         for (int j=0 ; i < argv.length-1 ;)
           srcs[j++] = new Path(argv[i++]);
         moveFromLocal(srcs, argv[i++]);
       } else if ("-get".equals(cmd) || "-copyToLocal".equals(cmd)) {
-        copyToLocal(argv, i);
+        long rate = -1L;
+        if (argv[i].equals("-rate")) {
+          i++;
+          rate = Long.parseLong(argv[i]);
+          if (rate <= 0L) {
+            throw new IllegalArgumentException(
+                "IO Throttler bandwidth must be positive. The input rate is invalid: " +
+                rate);
+          }
+          i++;
+        }
+        DataTransferThrottler throttler =
+          rate > 0L ? new DataTransferThrottler(rate) : null;
+        copyToLocal(argv, i, throttler);
       } else if ("-getmerge".equals(cmd)) {
         if (argv.length>i+2)
           copyMergeToLocal(argv[i++], new Path(argv[i++]), Boolean.parseBoolean(argv[i++]));
@@ -1944,7 +2183,7 @@ public class FsShell extends Configured implements Tool {
       } else if ("-chmod".equals(cmd) ||
                  "-chown".equals(cmd) ||
                  "-chgrp".equals(cmd)) {
-        FsShellPermissions.changePermissions(getFS(), cmd, argv, i, this);
+        FsShellPermissions.changePermissions(cmd, argv, i, this);
       } else if ("-ls".equals(cmd)) {
         if (i < argv.length) {
           exitCode = doall(cmd, argv, i);
@@ -1968,11 +2207,17 @@ public class FsShell extends Configured implements Tool {
         exitCode = rename(argv, getConf());
       } else if ("-cp".equals(cmd)) {
         exitCode = copy(argv, getConf());
+      } else if ("-hardlink".equals(cmd)) {
+        exitCode = hardlink(argv);
       } else if ("-compress".equals(cmd)) {
         exitCode = compress(argv, getConf());
       } else if ("-rm".equals(cmd)) {
         exitCode = doall(cmd, argv, i);
+      } else if ("-showlinks".equals(cmd)) {
+        exitCode = doall(cmd, argv, i);
       } else if ("-rmr".equals(cmd)) {
+        exitCode = doall(cmd, argv, i);
+      } else if ("-rmdir".equals(cmd)) {
         exitCode = doall(cmd, argv, i);
       } else if ("-expunge".equals(cmd)) {
         expunge();
@@ -1992,8 +2237,14 @@ public class FsShell extends Configured implements Tool {
         exitCode = new Count(argv, i, getConf()).runAll();
       } else if ("-mkdir".equals(cmd)) {
         exitCode = doall(cmd, argv, i);
+      } else if ("-filecrc".equals(cmd)) {
+        exitCode = doall(cmd, argv, i);
+      } else if ("-undelete".equals(cmd)) {
+        exitCode = doall(cmd, argv, i);
       } else if ("-touchz".equals(cmd)) {
         exitCode = doall(cmd, argv, i);
+      } else if ("-touch".equals(cmd)) {
+        FsShellTouch.touchFiles(getFS(), argv, i);
       } else if ("-test".equals(cmd)) {
         exitCode = test(argv, i);
       } else if ("-stat".equals(cmd)) {
@@ -2004,7 +2255,7 @@ public class FsShell extends Configured implements Tool {
         }
       } else if ("-help".equals(cmd)) {
         if (i < argv.length) {
-          printHelp(argv[i]);
+          printHelp(argv[i].substring(1));
         } else {
           printHelp("");
         }
@@ -2044,6 +2295,7 @@ public class FsShell extends Configured implements Tool {
                          e.getLocalizedMessage());
     } catch (Exception re) {
       exitCode = -1;
+      re.printStackTrace();
       System.err.println(cmd.substring(1) + ": " + re.getLocalizedMessage());
     } finally {
     }

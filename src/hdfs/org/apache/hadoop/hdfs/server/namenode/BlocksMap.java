@@ -17,9 +17,15 @@
  */
 package org.apache.hadoop.hdfs.server.namenode;
 
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 
 import org.apache.hadoop.hdfs.protocol.Block;
+import org.apache.hadoop.hdfs.server.namenode.INodeRaidStorage.RaidBlockInfo;
 import org.apache.hadoop.hdfs.util.GSet;
 import org.apache.hadoop.hdfs.util.LightWeightGSet;
 
@@ -33,7 +39,9 @@ public class BlocksMap {
   /**
    * Internal class for block metadata.
    */
-  static class BlockInfo extends Block implements LightWeightGSet.LinkedElement {
+  static public class BlockInfo extends Block implements LightWeightGSet.LinkedElement {
+    public static final int NO_BLOCK_CHECKSUM = 0;
+    
     private INodeFile          inode;
 
     /** For implementing {@link LightWeightGSet.LinkedElement} interface */
@@ -48,22 +56,32 @@ public class BlocksMap {
      * list of blocks belonging to this data-node.
      */
     private Object[] triplets;
-
-    /**
-     * Construct an entry for blocksmap
-     * @param replication the block's replication factor
-     */
-    protected BlockInfo(int replication) {
-      this.triplets = new Object[3*replication];
-      this.inode = null;
-    }
+    
+    private int checksum;
 
     BlockInfo(Block blk, int replication) {
       super(blk);
-      this.triplets = new Object[3*replication];
-      this.inode = null;
+      triplets = new Object[3*replication];
+      inode = null;
+      checksum = NO_BLOCK_CHECKSUM;
     }
-
+    
+    public BlockInfo() {
+      super();
+    }
+    
+    public void setChecksum(int checksum) {
+      this.checksum = checksum;
+    }
+    
+    public int getChecksum() {
+      return checksum;
+    }
+    
+    public void setReplication(int replication) {
+      triplets = new Object[3*replication];
+    }
+    
     INodeFile getINode() {
       return inode;
     }
@@ -115,6 +133,24 @@ public class BlocksMap {
       assert this.triplets != null : "BlockInfo is not initialized";
       assert triplets.length % 3 == 0 : "Malformed BlockInfo";
       return triplets.length / 3;
+    }
+    
+    /**
+     * Please be cautious when trying to implement this function, it doesn't write checksum whereas
+     * checksum is written separately in FSEditsLog and FSImage
+     */
+    @Override
+    public void write(DataOutput out) throws IOException {
+      super.write(out);
+    }
+
+    /**
+     * Please be cautious when trying to implement this function, it doesn't write checksum whereas
+     * checksum is read separately in FSEditsLog and FSImage
+     */
+    @Override
+    public void readFields(DataInput in) throws IOException {
+      super.readFields(in);
     }
 
     /**
@@ -298,15 +334,18 @@ public class BlocksMap {
       this.blockInfo = blkInfo;
     }
 
+    @Override
     public boolean hasNext() {
       return blockInfo != null && nextIdx < blockInfo.getCapacity()
               && blockInfo.getDatanode(nextIdx) != null;
     }
 
+    @Override
     public DatanodeDescriptor next() {
       return blockInfo.getDatanode(nextIdx++);
     }
 
+    @Override
     public void remove()  {
       throw new UnsupportedOperationException("Sorry. can't remove.");
     }
@@ -316,50 +355,56 @@ public class BlocksMap {
   private final int capacity;
   
   private GSet<Block, BlockInfo> blocks;
+  private final FSNamesystem ns;
 
-  BlocksMap(int initialCapacity, float loadFactor) {
-    this.capacity = computeCapacity();
+  BlocksMap(int initialCapacity, float loadFactor, FSNamesystem ns) {
+    // Use 2% of total memory
+    this.capacity = LightWeightGSet.computeCapacity(2.0, "BlocksMap");
     this.blocks = new LightWeightGSet<Block, BlockInfo>(capacity);
+    this.ns = ns;
+  }
+
+  public void close() {
+    blocks = null;
   }
 
   /**
-   * Let t = 2% of max memory.
-   * Let e = round(log_2 t).
-   * Then, we choose capacity = 2^e/(size of reference),
-   * unless it is outside the close interval [1, 2^30].
+   * All removals from the blocks map goes through this function.
+   * 
+   * @param b
+   *          block to be removed
+   * @param decrementSafeBlockCount
+   *          whether need to decrement safe block count when needed
+   * @return the {@link BlockInfo} for the removed block
    */
-  private static int computeCapacity() {
-    //VM detection
-    //See http://java.sun.com/docs/hotspot/HotSpotFAQ.html#64bit_detection
-    final String vmBit = System.getProperty("sun.arch.data.model");
-
-    //2% of max memory
-    final double twoPC = Runtime.getRuntime().maxMemory()/50.0;
-
-    //compute capacity
-    final int e1 = (int)(Math.log(twoPC)/Math.log(2.0) + 0.5);
-    final int e2 = e1 - ("32".equals(vmBit)? 2: 3);
-    final int exponent = e2 < 0? 0: e2 > 30? 30: e2;
-    final int c = 1 << exponent;
-
-    LightWeightGSet.LOG.info("VM type       = " + vmBit + "-bit");
-    LightWeightGSet.LOG.info("2% max memory = " + twoPC/(1 << 20) + " MB");
-    LightWeightGSet.LOG.info("capacity      = 2^" + exponent
-        + " = " + c + " entries");
-    return c;
-  }
-
-  void close() {
-    blocks = null;
+  private BlockInfo removeBlockFromMap(Block b) {
+    if (b == null) {
+      return null;
+    }
+     ns.decrementSafeBlockCountForBlockRemoval(b);
+    return blocks.remove(b);
   }
 
   /**
    * Add BlockInfo if mapping does not exist.
    */
   private BlockInfo checkBlockInfo(Block b, int replication) {
-    BlockInfo info = blocks.get(b);
+    // regular update always checks if the block is already in the map!
+    return checkBlockInfo(b, replication, true);
+  }
+  
+  private BlockInfo checkBlockInfo(Block b, int replication,
+      boolean checkExistence) {
+    // when loading regular files, we do not need to check if the blocks are
+    // already in the map - just allocate and insert
+    // for hardlink files, and outside of loading, we need to always check
+    BlockInfo info = checkExistence ? blocks.get(b) : null;
     if (info == null) {
-      info = new BlockInfo(b, replication);
+      if (b instanceof RaidBlockInfo) {
+        info = new RaidBlockInfo(b, replication, ((RaidBlockInfo)b).getIndex());
+      } else {
+        info = new BlockInfo(b, replication);
+      }
       blocks.put(info);
     }
     return info;
@@ -373,13 +418,71 @@ public class BlocksMap {
   BlockInfo getBlockInfo(Block b) {
     return blocks.get(b);
   }
-
+  
+  /**
+   * Add block b belonging to the specified file inode to the map
+   */
+  BlockInfo addINode(Block b, INodeFile iNode, short replication) {
+    BlockInfo info = checkBlockInfo(b, replication);
+    info.inode = iNode;
+    return info;
+  }
+  
   /**
    * Add block b belonging to the specified file inode to the map.
+   * Does not check for block existence, for non-hardlinked files.
    */
-  BlockInfo addINode(Block b, INodeFile iNode) {
-    BlockInfo info = checkBlockInfo(b, iNode.getReplication());
+  BlockInfo addINodeForLoading(Block b, INodeFile iNode) {
+    // allocate new block when loading the image
+    // for hardlinked files, we need to check if the blocks are already there
+    BlockInfo info = checkBlockInfo(b, iNode.getReplication(),
+        iNode.isHardlinkFile());
     info.inode = iNode;
+    return info;
+  }
+
+  /**
+   * Add block b belonging to the specified file inode to the map, this
+   * overwrites the map with the new block information.
+   */
+  public BlockInfo updateINode(BlockInfo oldBlock, Block newBlock, INodeFile iNode,
+      short replication, boolean forceUpdate) throws IOException {
+    // If the old block is not same as the new block, probably the GS was
+    // bumped up, hence update the block with new GS/size.
+    // If forceUpdate is true, we will always remove the old block and 
+    // update with new block, it's used by raid
+    List<DatanodeDescriptor> locations = null;
+    if (oldBlock != null && (!oldBlock.equals(newBlock) || forceUpdate)) {
+      if (oldBlock.getBlockId() != newBlock.getBlockId()) {
+        throw new IOException("block ids don't match : " + oldBlock + ", "
+            + newBlock);
+      }
+      if (forceUpdate) {
+        // save locations of the old block
+        locations = new ArrayList<DatanodeDescriptor>();
+        for (int i=0; i<oldBlock.numNodes(); i++) {
+          locations.add(oldBlock.getDatanode(i));
+        }
+      } else {
+        if (!iNode.isUnderConstruction()) {
+          throw new IOException(
+              "Try to update generation of a finalized block old block: "
+                  + oldBlock + ", new block: " + newBlock);
+        }
+      }
+      removeBlock(oldBlock);
+    }
+    BlockInfo info = checkBlockInfo(newBlock, replication);
+    info.set(newBlock.getBlockId(), newBlock.getNumBytes(), newBlock.getGenerationStamp());
+    info.inode = iNode;
+    if (locations != null) {
+      // add back the locations if needed
+      if (locations != null) {
+        for (DatanodeDescriptor d : locations) {
+          d.addBlock(info);
+        }
+      }
+    }
     return info;
   }
 
@@ -393,7 +496,7 @@ public class BlocksMap {
     if (info != null) {
       info.inode = null;
       if (info.getDatanode(0) == null) {  // no datanodes left
-        blocks.remove(b);  // remove block from the map
+        removeBlockFromMap(b); // remove block from the map
       }
     }
   }
@@ -403,7 +506,8 @@ public class BlocksMap {
    * remove it from all data-node lists it belongs to;
    * and remove all data-node locations associated with the block.
    */
-  void removeBlock(BlockInfo blockInfo) {
+  void removeBlock(Block block) {
+    BlockInfo blockInfo = removeBlockFromMap(block);
     if (blockInfo == null)
       return;
     blockInfo.inode = null;
@@ -411,15 +515,6 @@ public class BlocksMap {
       DatanodeDescriptor dn = blockInfo.getDatanode(idx);
       dn.removeBlock(blockInfo); // remove from the list and wipe the location
     }
-    blocks.remove(blockInfo);  // remove block from the map
-  }
-  
-  /**
-   * Remove the block from the block map;
-   */
-  void removeBlock(Block block) {
-    BlockInfo blockInfo = blocks.remove(block);
-    removeBlock(blockInfo);
   }
 
   /** Returns the block object it it exists in the map. */
@@ -467,17 +562,38 @@ public class BlocksMap {
 
     if (info.getDatanode(0) == null     // no datanodes left
               && info.inode == null) {  // does not belong to a file
-      blocks.remove(b);  // remove block from the map
+      removeBlockFromMap(b); // remove block from the map
     }
     return removed;
   }
 
   int size() {
-    return blocks.size();
+    return (blocks == null) ? 0 : blocks.size();
   }
 
   Iterable<BlockInfo> getBlocks() {
     return blocks;
+  }
+  
+  /**
+   * Get a list of shard iterators. Each iterator will travers only a part
+   * of the blocks map.
+   * @param numShards desired number of shards
+   * @return list of iterators (size might be smaller than
+   *          numShards if blocks map has fewer buckets)
+   */
+  List<Iterator<BlockInfo>> getBlocksIterarors(int numShards) {
+    List<Iterator<BlockInfo>> iterators = new ArrayList<Iterator<BlockInfo>>();
+    if (numShards <= 0) {
+      throw new IllegalArgumentException("Number of shards must be greater than 0");
+    }
+    for (int i = 0; i < numShards; i++) {
+      Iterator<BlockInfo> iterator = blocks.shardIterator(i, numShards);
+      if (iterator != null) {
+        iterators.add(iterator);
+      }
+    }   
+    return iterators;
   }
   /**
    * Check if the block exists in map

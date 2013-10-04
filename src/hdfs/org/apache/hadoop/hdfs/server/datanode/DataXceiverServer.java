@@ -30,8 +30,12 @@ import org.apache.commons.logging.Log;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.server.balancer.Balancer;
-import org.apache.hadoop.hdfs.util.DataTransferThrottler;
+import org.apache.hadoop.hdfs.server.datanode.metrics.DatanodeThreadLivenessReporter;
+import org.apache.hadoop.hdfs.server.datanode.metrics.DatanodeThreadLivenessReporter.BackgroundThread;
+import org.apache.hadoop.hdfs.util.InjectionEvent;
 import org.apache.hadoop.util.Daemon;
+import org.apache.hadoop.util.DataTransferThrottler;
+import org.apache.hadoop.util.InjectionHandler;
 import org.apache.hadoop.util.StringUtils;
 
 /**
@@ -42,7 +46,8 @@ import org.apache.hadoop.util.StringUtils;
  */
 class DataXceiverServer implements Runnable, FSConstants {
   public static final Log LOG = DataNode.LOG;
-  
+  static final Log ClientTraceLog = DataNode.ClientTraceLog;
+
   ServerSocket ss;
   DataNode datanode;
   // Record all sockets opend for data transfer
@@ -65,14 +70,17 @@ class DataXceiverServer implements Runnable, FSConstants {
    */
   static class BlockBalanceThrottler extends DataTransferThrottler {
    private int numThreads;
+   private int maxNumThreads;
    
    /**Constructor
     * 
     * @param bandwidth Total amount of bandwidth can be used for balancing 
     */
-   private BlockBalanceThrottler(long bandwidth) {
+   private BlockBalanceThrottler(long bandwidth, int maxNumThreads) {
      super(bandwidth);
-     LOG.info("Balancing bandwith is "+ bandwidth + " bytes/s");
+     this.maxNumThreads = maxNumThreads;
+     LOG.info("Balancing bandwith is "+ bandwidth 
+            + " bytes/s and max number of threads is " + maxNumThreads);
    }
    
    /** Check if the block move can start. 
@@ -81,7 +89,7 @@ class DataXceiverServer implements Runnable, FSConstants {
     * the counter is incremented; False otherwise.
     */
    synchronized boolean acquire() {
-     if (numThreads >= Balancer.MAX_NUM_CONCURRENT_MOVES) {
+     if (numThreads >= maxNumThreads) {
        return false;
      }
      numThreads++;
@@ -120,7 +128,10 @@ class DataXceiverServer implements Runnable, FSConstants {
     
     //set up parameter for cluster balancing
     this.balanceThrottler = new BlockBalanceThrottler(
-      conf.getLong("dfs.balance.bandwidthPerSec", 1024L*1024));
+      conf.getLong("dfs.balance.bandwidthPerSec", 1024L*1024),
+         Math.max(Balancer.MAX_NUM_CONCURRENT_MOVES, 
+           conf.getInt("dfs.balance.maxNumThreads",
+                       Balancer.MAX_NUM_CONCURRENT_MOVES)));
   }
 
   /**
@@ -128,27 +139,28 @@ class DataXceiverServer implements Runnable, FSConstants {
   public void run() {
     while (datanode.shouldRun) {
       try {
-        Socket s = ss.accept();
-        s.setTcpNoDelay(true);
-        s.setSoTimeout(datanode.socketTimeout*5);
+        datanode
+            .updateAndReportThreadLiveness(BackgroundThread.DATA_XCEIVER_SERVER);
 
-        // Log right after accepting an connection
-        String remoteAddress = s.getRemoteSocketAddress().toString();
-        String localAddress = s.getLocalSocketAddress().toString();
-        LOG.info("Accepted new connection: src " + remoteAddress + " dest "
-            + localAddress + " XceiverCount: " + datanode.getXceiverCount());
+        ss.setSoTimeout(1000);
+        InjectionHandler.processEvent(
+            InjectionEvent.DATAXEIVER_SERVER_PRE_ACCEPT);
+        Socket s = ss.accept();
+        
         new Daemon(datanode.threadGroup, 
             new DataXceiver(s, datanode, this)).start();
-
+        InjectionHandler.processEvent(
+            InjectionEvent.AVATARXEIVER_RUNTIME_FAILURE);
+        
       } catch (SocketTimeoutException ignored) {
         // wake up to see if should continue to run
       } catch (IOException ie) {
-        LOG.warn(datanode.getDatanodeInfo() + ":DataXceiveServer: " 
-                                + StringUtils.stringifyException(ie));
+        datanode.myMetrics.dataXceiverConnFailures.inc();
+        LOG.warn(datanode.getDatanodeInfo() + ":DataXceiveServer IO error", ie);
       } catch (Throwable te) {
-        LOG.error(datanode.getDatanodeInfo() + ":DataXceiveServer: Exiting due to:" 
-                                 + StringUtils.stringifyException(te));
         datanode.shouldRun = false;
+        datanode.myMetrics.dataXceiverConnFailures.inc();
+        LOG.error(datanode.getDatanodeInfo() + ":DataXceiveServer exiting", te); 
       }
     }
     try {

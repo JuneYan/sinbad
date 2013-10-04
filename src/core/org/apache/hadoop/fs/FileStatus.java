@@ -67,6 +67,11 @@ public class FileStatus implements Writable, Comparable {
     this.path = path;
   }
 
+  public FileStatus(FileStatus elem) {
+    this(elem.length, elem.isdir, elem.block_replication, elem.blocksize, elem.modification_time,
+        elem.access_time, elem.permission, elem.owner, elem.group, elem.path);
+  }
+
   /**
    * Get the length of this file, in bytes.
    * @return the length of this file, in bytes.
@@ -215,8 +220,8 @@ public class FileStatus implements Writable, Comparable {
     out.writeLong(modification_time);
     out.writeLong(access_time);
     permission.write(out);
-    Text.writeString(out, owner);
-    Text.writeString(out, group);
+    Text.writeStringOpt(out, owner);
+    Text.writeStringOpt(out, group);
   }
 
   public void readFields(DataInput in) throws IOException {
@@ -229,8 +234,39 @@ public class FileStatus implements Writable, Comparable {
     modification_time = in.readLong();
     access_time = in.readLong();
     permission.readFields(in);
-    owner = Text.readString(in);
-    group = Text.readString(in);
+    owner = Text.readStringOpt(in);
+    group = Text.readStringOpt(in);
+  }
+
+  public static void write(DataOutput out, FileStatus elem) throws IOException {
+    FileStatus status = new FileStatus(elem);
+    status.write(out);
+  }
+
+  public static FileStatus read(DataInput in) throws IOException {
+    FileStatus status = new FileStatus();
+    status.readFields(in);
+    return status;
+  }
+
+  public boolean compareFull(Object o, boolean closedFile) {
+    if (this == o)
+      return true;
+    if (o == null || getClass() != o.getClass())
+      return false;
+    FileStatus other = (FileStatus) o;
+    if(closedFile && (other.getLen() != this.getLen())) {
+      return false;
+    }
+    return (other.isDir() == this.isDir()
+        && other.getReplication() == this.getReplication()
+        && other.getBlockSize() == this.getBlockSize()
+        && other.getModificationTime() == this.getModificationTime()
+        && other.getAccessTime() == this.getAccessTime()
+        && other.getPermission().equals(this.getPermission())
+        && other.getOwner().equals(this.getOwner())
+        && other.getGroup().equals(this.getGroup())
+        && other.getPath().equals(this.getPath()));
   }
 
   /**
@@ -274,5 +310,14 @@ public class FileStatus implements Writable, Comparable {
    */
   public int hashCode() {
     return getPath().hashCode();
+  }
+
+  @Override
+  public String toString() {
+    return "FileStatus [path=" + path + ", length=" + length + ", isdir="
+        + isdir + ", block_replication=" + block_replication + ", blocksize="
+        + blocksize + ", modification_time=" + modification_time
+        + ", access_time=" + access_time + ", permission=" + permission
+        + ", owner=" + owner + ", group=" + group + "]";
   }
 }

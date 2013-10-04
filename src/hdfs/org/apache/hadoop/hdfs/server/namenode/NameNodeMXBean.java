@@ -17,6 +17,10 @@
  */
 package org.apache.hadoop.hdfs.server.namenode;
 
+import java.util.Map;
+
+import org.apache.hadoop.hdfs.server.namenode.ClusterJspHelper.NameNodeKey;
+
 /**
  * This is the JMX management interface for namenode information
  */
@@ -105,13 +109,13 @@ public interface NameNodeMXBean {
    * @return the total number of blocks of the cluster
    */
   public long getTotalBlocks();
-  
+
   /**
-   * Gets the total number of files on the cluster
+   * Gets the total number of files and directories on the cluster
    * 
-   * @return the total number of files on the cluster
+   * @return the total number of files and directories on the cluster
    */
-  public long getTotalFiles();
+  public long getTotalFilesAndDirectories();
   
   /**
    * Gets the total number of missing blocks on the cluster
@@ -168,4 +172,15 @@ public interface NameNodeMXBean {
    * @return the safe mode text shown in the web ui 
    */
   public String getSafeModeText();
+  
+  /**
+   * Gets specific namenode keys
+   * 
+   */
+  public Map<NameNodeKey, String> getNNSpecificKeys();
+
+  /**
+   * Return true if the NN acts as the primary
+   */
+  public boolean getIsPrimary();
 }

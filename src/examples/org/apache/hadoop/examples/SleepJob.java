@@ -73,7 +73,7 @@ public class SleepJob extends Configured implements Tool,
   private int reduceSleepCount = 1;
   private int count = 0;
   private int countersPerTask = 0;
-  private RunningJob rJob = null;
+  protected RunningJob rJob = null;
 
   private static Random generator = new Random();
   
@@ -115,7 +115,7 @@ public class SleepJob extends Configured implements Tool,
     public InputSplit[] getSplits(JobConf conf, int numSplits) {
       InputSplit[] ret = new InputSplit[numSplits];
       String hostsStr = conf.get(HOSTS_FOR_LOCALITY, "");
-      int hostsPerSplit = conf.getInt(HOSTS_PER_SPLIT, 1);
+      int hostsPerSplit = conf.getInt(HOSTS_PER_SPLIT, 0);
       // If hostsStr is empty, hosts will be [""]
       String [] hosts = hostsStr.split(",");
       
@@ -177,7 +177,7 @@ public class SleepJob extends Configured implements Tool,
     }
     return counterNames;
   }
-  
+
   public void map(IntWritable key, IntWritable value,
       OutputCollector<IntWritable, NullWritable> output, Reporter reporter)
       throws IOException {
@@ -291,13 +291,15 @@ public class SleepJob extends Configured implements Tool,
       int mapSleepCount, long reduceSleepTime,
       int reduceSleepCount, boolean doSpeculation,
       List<String> slowMaps, List<String> slowReduces,
-      int slowRatio, int countersPerTask, List<String> hosts, int hostsPerSplit) 
+      int slowRatio, int countersPerTask, List<String> hosts, int hostsPerSplit,
+      boolean setup, int sortMemory) 
           throws IOException {
 
     JobConf job = setupJobConf(numMapper, numReducer, mapSleepTime, 
                   mapSleepCount, reduceSleepTime, reduceSleepCount,
                   doSpeculation, slowMaps, slowReduces, slowRatio,
-                  countersPerTask, hosts, hostsPerSplit);
+                  countersPerTask, hosts, hostsPerSplit, setup,
+                  sortMemory);
 
 
     rJob = JobClient.runJob(job);
@@ -311,25 +313,47 @@ public class SleepJob extends Configured implements Tool,
     return setupJobConf(numMapper, numReducer, mapSleepTime, mapSleepCount,
 
         reduceSleepTime, reduceSleepCount, false, EMPTY, EMPTY, 1, 0,
-        new ArrayList<String>(), 1);
+        new ArrayList<String>(), 1, false, 0);
   }
 
-  public JobConf setupJobConf(int numMapper, int numReducer, 
+  public JobConf setupJobConf( int numMapper, int numReducer, 
                                 long mapSleepTime, int mapSleepCount, 
                                 long reduceSleepTime, int reduceSleepCount,
                                 boolean doSpeculation, List<String> slowMaps,
                                 List<String> slowReduces, int slowRatio,
                                 int countersPerTask, List<String> hosts,
-                                int hostsPerSplit) {
+                                int hostsPerSplit, boolean setup,
+                                int sortMemory) {
     
-    JobConf job = new JobConf(getConf(), SleepJob.class);
+    return setupJobConf(SleepJob.class,
+                        numMapper, numReducer,
+                        mapSleepTime, mapSleepCount,
+                        reduceSleepTime, reduceSleepCount,
+                        doSpeculation, slowMaps,
+                        slowReduces, slowRatio,
+                        countersPerTask, hosts,
+                        hostsPerSplit, setup, sortMemory);
+  }
+  @SuppressWarnings({ "deprecation", "unchecked" })
+  public JobConf setupJobConf(Class classToSet,
+                                int numMapper, int numReducer, 
+                                long mapSleepTime, int mapSleepCount, 
+                                long reduceSleepTime, int reduceSleepCount,
+                                boolean doSpeculation, List<String> slowMaps,
+                                List<String> slowReduces, int slowRatio,
+                                int countersPerTask, List<String> hosts,
+                                int hostsPerSplit, boolean setup,
+                                int sortMemory) {
+    
+    JobConf job = new JobConf(getConf(), classToSet);
     job.setNumMapTasks(numMapper);
     job.setNumReduceTasks(numReducer);
-    job.setMapperClass(SleepJob.class);
+    job.setMapperClass(classToSet);
     job.setMapOutputKeyClass(IntWritable.class);
     job.setMapOutputValueClass(NullWritable.class);
-    job.setReducerClass(SleepJob.class);
+    job.setReducerClass(classToSet);
     job.setOutputFormat(NullOutputFormat.class);
+    job.setJobSetupCleanupNeeded(setup);
     job.setInputFormat(SleepInputFormat.class);
     job.setPartitionerClass(SleepJob.class);
     job.setJobName("Sleep job");
@@ -338,6 +362,9 @@ public class SleepJob extends Configured implements Tool,
     job.setLong("sleep.job.reduce.sleep.time", reduceSleepTime);
     job.setInt("sleep.job.map.sleep.count", mapSleepCount);
     job.setInt("sleep.job.reduce.sleep.count", reduceSleepCount);
+    if (sortMemory != 0) { 
+      job.setInt("io.sort.mb", sortMemory);
+    }
     job.setSpeculativeExecution(doSpeculation);
     job.setInt(SLOW_RATIO, slowRatio);
     job.setStrings(SLOW_MAPS, slowMaps.toArray(new String[slowMaps.size()]));
@@ -353,11 +380,13 @@ public class SleepJob extends Configured implements Tool,
     if(args.length < 1) {
       System.err.println("SleepJob [-m numMapper] [-r numReducer]" +
           " [-mt mapSleepTime (msec)] [-rt reduceSleepTime (msec)]" +
+          " [-memory sortMemory(m)]" +
           " [-recordt recordSleepTime (msec)]" +
           " [-slowmaps slowMaps (int separated by ,)]" +
           " [-slowreduces slowReduces (int separated by ,)]" +
           " [-slowratio slowRatio]" + 
           " [-counters numCountersToIncPerRecordPerTask]" +
+          " [-nosetup]" +
           " [-hosts hostsToRunMaps (for testing locality. host names" + 
           " separated by ,)]" +
           " [-hostspersplit numHostsPerSplit (for testing locality. number" +
@@ -371,13 +400,15 @@ public class SleepJob extends Configured implements Tool,
     int numMapper = 1, numReducer = 1;
     long mapSleepTime = 100, reduceSleepTime = 100, recSleepTime = 100;
     int mapSleepCount = 1, reduceSleepCount = 1;
-    int hostsPerSplit = 1;
+    int hostsPerSplit = 0;
     List<String> slowMaps = Collections.emptyList();
     List<String> slowReduces = Collections.emptyList();
     int slowRatio = 10;
+    boolean setup = true;
     boolean doSpeculation = false;
     List<String> hosts = new ArrayList<String>();
     int countersPerTask = 0;
+    int sortMemory = 0;
     
     for(int i=0; i < args.length; i++ ) {
       if(args[i].equals("-m")) {
@@ -391,6 +422,9 @@ public class SleepJob extends Configured implements Tool,
       }
       else if(args[i].equals("-rt")) {
         reduceSleepTime = Long.parseLong(args[++i]);
+      }
+      else if (args[i].equals("-memory")) {
+        sortMemory = Integer.parseInt(args[++i]);
       }
       else if (args[i].equals("-recordt")) {
         recSleepTime = Long.parseLong(args[++i]);
@@ -421,6 +455,9 @@ public class SleepJob extends Configured implements Tool,
       }
       else if (args[i].equals("-hostspersplit")) {
         hostsPerSplit = Integer.parseInt(args[++i]);
+      } 
+      else if (args[i].equals("-nosetup")) {
+        setup = false;
       }
       else {
         System.err.println("Invalid option " + args[i]);
@@ -435,7 +472,7 @@ public class SleepJob extends Configured implements Tool,
     return run(numMapper, numReducer, mapSleepTime, mapSleepCount,
         reduceSleepTime, reduceSleepCount,
         doSpeculation, slowMaps, slowReduces, slowRatio, countersPerTask, 
-        hosts, hostsPerSplit);
+        hosts, hostsPerSplit, setup, sortMemory);
   }
 
   private List<String> parseSlowTaskList(String input) {

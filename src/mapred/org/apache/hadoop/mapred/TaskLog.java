@@ -58,9 +58,15 @@ public class TaskLog {
   private static final Log LOG =
     LogFactory.getLog(TaskLog.class);
 
-  private static final File LOG_DIR = 
-    new File(System.getProperty("hadoop.log.dir"), 
-             "userlogs").getAbsoluteFile();
+  private static final File LOG_DIR = getLogDir(
+    System.getProperty("hadoop.log.dir"));
+  private static final File JT_LOG_DIR = getLogDir(
+    System.getProperty("hadoop.log.dir") + File.separator 
+    + "jtlogs");
+
+  static File getLogDir(String hadoopLogDir) {
+    return new File(hadoopLogDir, "userlogs").getAbsoluteFile();
+  }
   
   // localFS is set in (and used by) writeToIndexFile()
   static LocalFileSystem localFS = null;
@@ -182,6 +188,10 @@ public class TaskLog {
   
   static File getBaseDir(String taskid) {
     return new File(LOG_DIR, taskid);
+  }
+  
+  static File getJTBaseDir(String taskid) {
+    return new File(JT_LOG_DIR, taskid);
   }
 
   static final List<LogName> LOGS_TRACKED_BY_INDEX_FILES =
@@ -321,9 +331,15 @@ public class TaskLog {
    */
   static void cleanup(int logsRetainHours, int logsNumberLimit
                                              ) throws IOException {
+    cleanup(TaskLog.getUserLogDir(), logsRetainHours, logsNumberLimit);
+  }
+
+  static void cleanup(File logDir, int logsRetainHours, int logsNumberLimit
+                                             ) throws IOException {
     //Delete logs of tasks if the number of files exceed fileNumberLimit
-    File LOG_DIR = TaskLog.getUserLogDir();
-    File[] totalLogs = LOG_DIR.listFiles();
+    LOG.info("TaskLog.cleanup: logsRetainHours=" + logsRetainHours +
+      " logsNumberLimit=" + logsNumberLimit);
+    File[] totalLogs = logDir.listFiles();
     long purgeTimeStamp = System.currentTimeMillis() -
                             (logsRetainHours*60L*60*1000);
     if (totalLogs != null) {
@@ -337,12 +353,14 @@ public class TaskLog {
         });
         // deleting half of the oldest logs
         for (int i=0; i < numLogs / 2; i++) {
+          LOG.info("TaskLog.cleanup deleting " + totalLogs[i]);
           FileUtil.fullyDelete(totalLogs[i]);
         }
         // now, delete the remaining ones that are older than purgeTimeStamp
         // since the array is sorted, break the loop once we pass the boundary
         for (int i = numLogs / 2; i < numLogs; i++) {
           if (totalLogs[i].lastModified() < purgeTimeStamp) {
+            LOG.info("TaskLog.cleanup deleting " + totalLogs[i]);
             FileUtil.fullyDelete(totalLogs[i]);
           } else {
             break;
@@ -353,6 +371,7 @@ public class TaskLog {
       // older than PurgeTimeStamp
         for (int i=0; i < numLogs; i++) {
           if (totalLogs[i].lastModified() < purgeTimeStamp) {
+            LOG.info("TaskLog.cleanup deleting " + totalLogs[i]);
             FileUtil.fullyDelete(totalLogs[i]);
           }
         }
@@ -362,7 +381,7 @@ public class TaskLog {
 
   static class Reader extends InputStream {
     private long bytesRemaining;
-    private FileInputStream file;
+    private FileInputStream file ;
 
     public Reader(TaskAttemptID taskid, LogName kind, 
                   long start, long end) throws IOException {
@@ -384,9 +403,23 @@ public class TaskLog {
     public Reader(TaskAttemptID taskid, LogName kind, 
                   long start, long end, boolean isCleanup) throws IOException {
       // find the right log file
-      Map<LogName, LogFileDetail> allFilesDetails =
+      LogFileDetail fileDetail;
+      File jtLog = null;
+      try {
+        Map<LogName, LogFileDetail> allFilesDetails =
           getAllLogsFileDetails(taskid, isCleanup);
-      LogFileDetail fileDetail = allFilesDetails.get(kind);
+        fileDetail = allFilesDetails.get(kind);
+      } catch (IOException e) {
+        jtLog = new File(getJTBaseDir(taskid.toString()), kind.toString());
+        if (!jtLog.isFile()) {
+          throw e;
+        }
+        
+        fileDetail = new LogFileDetail();
+        fileDetail.location = taskid.toString();
+        fileDetail.start = 0;
+        fileDetail.length = jtLog.length();
+      }
       // calculate the start and stop
       long size = fileDetail.length;
       if (start < 0) {
@@ -400,8 +433,12 @@ public class TaskLog {
       start += fileDetail.start;
       end += fileDetail.start;
       bytesRemaining = end - start;
-      file = new FileInputStream(new File(getBaseDir(fileDetail.location), 
+      if (jtLog == null) {
+        file = new FileInputStream(new File(getBaseDir(fileDetail.location), 
           kind.toString()));
+      } else {
+        file = new FileInputStream(jtLog);
+      }
       // skip upto start
       long pos = 0;
       while (pos < start) {

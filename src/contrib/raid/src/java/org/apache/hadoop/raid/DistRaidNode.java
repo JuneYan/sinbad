@@ -31,6 +31,7 @@ import org.apache.hadoop.util.Daemon;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.FileStatus;
 
+import org.apache.hadoop.raid.DistRaid.EncodingCandidate;
 import org.apache.hadoop.raid.protocol.PolicyInfo;
 
 /**
@@ -85,17 +86,27 @@ public class DistRaidNode extends RaidNode {
    */
   @Override
   void raidFiles(PolicyInfo info, List<FileStatus> paths) throws IOException {
+    raidFiles(conf, jobMonitor, paths, info);
+  }
+
+  final static DistRaid raidFiles(Configuration conf, JobMonitor jobMonitor,
+      List<FileStatus> paths, PolicyInfo info) throws IOException {
+    List<EncodingCandidate> lec = splitPaths(conf,
+        Codec.getCodec(info.getCodecId()), paths);
+    
     // We already checked that no job for this policy is running
     // So we can start a new job.
     DistRaid dr = new DistRaid(conf);
     //add paths for distributed raiding
-    dr.addRaidPaths(info, paths);
+    dr.addRaidPaths(info, lec);
     boolean started = dr.startDistRaid();
     if (started) {
       jobMonitor.monitorJob(info.getName(), dr);
+    } else {
+      return null;
     }
+    return dr;
   }
-
   /**
    * {@inheritDocs}
    */

@@ -34,6 +34,7 @@ import java.text.StringCharacterIterator;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.io.UTF8.TempArrays;
 
 /** This class stores text using standard UTF8 encoding.  It provides methods
  * to serialize, deserialize, and compare texts at byte level.  The type of
@@ -47,7 +48,8 @@ import org.apache.commons.logging.LogFactory;
 public class Text extends BinaryComparable
     implements WritableComparable<BinaryComparable> {
   private static final Log LOG= LogFactory.getLog(Text.class);
-  
+  private static final int NULL_STRING_LENGTH = -1;
+
   private static ThreadLocal<CharsetEncoder> ENCODER_FACTORY =
     new ThreadLocal<CharsetEncoder>() {
       protected CharsetEncoder initialValue() {
@@ -402,6 +404,32 @@ public class Text extends BinaryComparable
     in.readFully(bytes, 0, length);
     return decode(bytes);
   }
+  
+  /** Read a UTF8 encoded string from in
+   */
+  public static String readStringOpt(DataInput in) throws IOException {
+    final int length = WritableUtils.readVInt(in);
+    if (length == NULL_STRING_LENGTH) {
+      return null;
+    }
+    byte [] bytes = new byte[length];
+    in.readFully(bytes, 0, length);
+    char[] charArray = UTF8.getCharArray(length);
+    for (int i = 0; i < bytes.length; i++) {
+      if (bytes[i] < UTF8.MIN_ASCII_CODE) {
+        // non-ASCII codepoints' higher bytes
+        // are of the form (10xxxxxx), hence the bytes
+        // represent a non-ASCII string
+        // do expensive conversion
+        return decode(bytes);
+      }
+      // copy to temporary array
+      charArray[i] = (char) bytes[i];
+    }
+    // only ASCII bytes, do fast conversion
+    // using bytes as actual characters
+    return new String(charArray, 0, length);
+  }
 
   /** Write a UTF8 encoded string to out
    */
@@ -411,6 +439,38 @@ public class Text extends BinaryComparable
     WritableUtils.writeVInt(out, length);
     out.write(bytes.array(), 0, length);
     return length;
+  }
+  
+  /**
+   * Writes the string to the output, if possible
+   * the encoding part is optimized.
+   */
+  public static void writeStringOpt(DataOutput out, String str) 
+      throws IOException{
+    if (str == null) {
+      WritableUtils.writeVInt(out, NULL_STRING_LENGTH);
+      return;
+    }
+    final int len = str.length();
+    TempArrays ta = UTF8.getArrays(len);
+    byte[] rawBytes = ta.byteArray;
+    char[] charArray = ta.charArray;
+    str.getChars(0, len, charArray, 0);
+
+    boolean ascii = true;
+    for (int i = 0; i < len; i++) {
+      if (charArray[i] > UTF8.MAX_ASCII_CODE) {
+        ascii = false;
+        break;
+      }
+      rawBytes[i] = (byte) charArray[i];
+    }
+    if(ascii) {
+      WritableUtils.writeVInt(out, len);
+      out.write(rawBytes, 0, len);
+    } else {
+      writeString(out, str);
+    }
   }
 
   ////// states for validateUTF8

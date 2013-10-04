@@ -18,53 +18,21 @@
 
 package org.apache.hadoop.hdfs;
 
-import java.io.IOException;
-
 import org.junit.Test;
-import org.junit.Before;
-import org.junit.After;
-import org.junit.BeforeClass;
-import org.junit.AfterClass;
 import static org.junit.Assert.*;
+
+import java.io.OutputStream;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-
-import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.BlockLocation;
+import org.apache.hadoop.hdfs.protocol.FSConstants.DatanodeReportType;
+import org.apache.hadoop.hdfs.util.InjectionEvent;
+import org.apache.hadoop.util.InjectionEventI;
+import org.apache.hadoop.util.InjectionHandler;
 
-public class TestAvatarFailover {
+public class TestAvatarFailover extends AvatarSetupUtil {
   final static Log LOG = LogFactory.getLog(TestAvatarFailover.class);
-
-  private static final String FILE_PATH = "/dir1/dir2/myfile";
-  private static final long FILE_LEN = 512L * 1024L;
-
-  private Configuration conf;
-  private MiniAvatarCluster cluster;
-  private DistributedAvatarFileSystem dafs;
-  private Path path;
-
-  @BeforeClass
-  public static void setUpStatic() throws Exception {
-    MiniAvatarCluster.createAndStartZooKeeper();
-  }
-
-  public void setUp(boolean federation) throws Exception {
-    conf = new Configuration();
-    if (!federation) {
-      cluster = new MiniAvatarCluster(conf, 3, true, null, null);
-      dafs = cluster.getFileSystem();
-    } else {
-      cluster = new MiniAvatarCluster(conf, 3, true, null, null, 1, true);
-      dafs = cluster.getFileSystem(0);
-    }
-    
-    path = new Path(FILE_PATH);    
-    DFSTestUtil.createFile(dafs, path, FILE_LEN, (short)1, 0L);
-  }
 
   /**
    * Test if we can get block locations after killing the primary avatar
@@ -72,7 +40,7 @@ public class TestAvatarFailover {
    */
   @Test
   public void testFailOver() throws Exception {
-    setUp(false);
+    setUp(false, "testFailOver");
     int blocksBefore = blocksInFile();
 
     LOG.info("killing primary");
@@ -87,7 +55,7 @@ public class TestAvatarFailover {
   
   @Test
   public void testFailOverWithFederation() throws Exception {
-    setUp(true);
+    setUp(true, "testFailOverWithFederation");
     int blocksBefore = blocksInFile();
 
     LOG.info("killing primary");
@@ -105,7 +73,7 @@ public class TestAvatarFailover {
    */
   @Test
   public void testKillStandby() throws Exception {
-    setUp(false);
+    setUp(false, "testKillStandby");
     int blocksBefore = blocksInFile();
 
     LOG.info("killing standby");
@@ -118,7 +86,7 @@ public class TestAvatarFailover {
   
   @Test
   public void testKillStandbyWithFederation() throws Exception {
-    setUp(true);
+    setUp(true, "testKillStandbyWithFederation");
     int blocksBefore = blocksInFile();
 
     LOG.info("killing standby");
@@ -135,7 +103,7 @@ public class TestAvatarFailover {
    */
   @Test
   public void testResurrectStandbyFailOver() throws Exception {
-    setUp(false);
+    setUp(false, "testResurrectStandbyFailOver");
     int blocksBefore = blocksInFile();
 
     LOG.info("killing standby");
@@ -161,7 +129,7 @@ public class TestAvatarFailover {
   
   @Test
   public void testResurrectStandbyFailOverWithFederation() throws Exception {
-    setUp(true);
+    setUp(true, "testResurrectStandbyFailOverWithFederation");
     int blocksBefore = blocksInFile();
 
     LOG.info("killing standby");
@@ -194,7 +162,7 @@ public class TestAvatarFailover {
    */
   @Test
   public void testDoubleFailOver() throws Exception {
-    setUp(false);
+    setUp(false, "testDoubleFailOver");
     int blocksBefore = blocksInFile();
 
     LOG.info("killing primary 1");
@@ -205,7 +173,7 @@ public class TestAvatarFailover {
     cluster.restartStandby();
 
     try {
-      Thread.sleep(2000);
+      Thread.sleep(3000);
     } catch (InterruptedException ignore) {
       // do nothing
     }
@@ -222,7 +190,7 @@ public class TestAvatarFailover {
   
   @Test
   public void testDoubleFailOverWithFederation() throws Exception {
-    setUp(true);
+    setUp(true, "testDoubleFailOverWithFederation");
     int blocksBefore = blocksInFile();
 
     LOG.info("killing primary 1");
@@ -233,7 +201,7 @@ public class TestAvatarFailover {
     cluster.restartStandby(0);
 
     try {
-      Thread.sleep(2000);
+      Thread.sleep(3000);
     } catch (InterruptedException ignore) {
       // do nothing
     }
@@ -245,29 +213,90 @@ public class TestAvatarFailover {
 
     int blocksAfter = blocksInFile();
     assertTrue(blocksBefore == blocksAfter);
-
   }
 
-  @After
-  public void shutDown() throws Exception {
-    dafs.close();
-    cluster.shutDown();
+  @Test
+  public void testDatanodeStartupDuringFailover() throws Exception {
+    setUp(false, "testDatanodeStartupDuringFailover");
+    cluster.killPrimary();
+    cluster.restartDataNodes(false);
+    long start = System.currentTimeMillis();
+    int live = 0;
+    int total = 3;
+    while (System.currentTimeMillis() - start < 30000 && live != total) {
+      live = cluster.getStandbyAvatar(0).avatar
+          .getDatanodeReport(DatanodeReportType.LIVE).length;
+      total = cluster.getStandbyAvatar(0).avatar
+          .getDatanodeReport(DatanodeReportType.ALL).length;
+    }
+    assertEquals(total, live);
   }
 
-  @AfterClass
-  public static void shutDownStatic() throws Exception {
-    MiniAvatarCluster.shutDownZooKeeper();
+  private static boolean passDeadDnFailover = true;
+  private static boolean failedOver = false;
+
+  private class FailoverThread extends Thread {
+    public void run() {
+      try {
+        cluster.failOver();
+        failedOver = true;
+      } catch (Exception e) {
+        passDeadDnFailover = false;
+      }
+    }
   }
 
-
-  static int blocksInFile(FileSystem fs, Path path, long len) 
-    throws IOException {
-    FileStatus f = fs.getFileStatus(path);
-    return fs.getFileBlockLocations(f, 0L, len).length;
+  @Test
+  public void testDatanodeStartupFailover() throws Throwable {
+    setUp(false, "testDatanodeStartupFailover");
+    cluster.shutDownDataNodes();
+    Thread fThread = new FailoverThread();
+    fThread.setDaemon(true);
+    fThread.start();
+    Thread.sleep(3000);
+    cluster.restartDataNodes(false);
+    fThread.join(30000);
+    try {
+      assertTrue(passDeadDnFailover);
+      assertTrue(failedOver);
+    } catch (Throwable e) {
+      fThread.interrupt();
+      throw e;
+    }
   }
 
-  private int blocksInFile() throws IOException {
-    return blocksInFile(dafs, path, FILE_LEN);
+  private static class TestAvatarFailoverHandler extends InjectionHandler {
+    protected boolean _falseCondition(InjectionEventI event, Object... args) {
+      if (event == InjectionEvent.DFSCLIENT_FINGERPRINT_MISMATCH) {
+        return true;
+      }
+      return false;
+    }
   }
 
+  /**
+   * This tests a failover when the client and server fingerprints don't match.
+   */
+  @Test
+  public void testFailoverWithFingerPrintMismatch() throws Exception {
+    int blocksize = 1024;
+    setUp(false, "testFailoverWithFingerPrintMismatch", blocksize);
+
+    // Write some data.
+    OutputStream out = dafs.create(new Path("/test"));
+    byte[] buffer = new byte[blocksize];
+    out.write(buffer, 0, buffer.length);
+
+    // Perform the failover.
+    cluster.failOver();
+    TestAvatarFailoverHandler h = new TestAvatarFailoverHandler();
+    InjectionHandler.set(h);
+
+    // This should get a new block from the namenode and simulate the finger
+    // print mismatch.
+    out.write(buffer, 0, buffer.length);
+    out.write(buffer, 0, buffer.length);
+    out.close();
+
+  }
 }

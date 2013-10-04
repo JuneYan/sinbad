@@ -28,6 +28,7 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.util.DiskChecker.DiskErrorException;
 import org.apache.hadoop.conf.Configuration; 
+import org.apache.hadoop.util.DataDirFileReader;
 
 /** An implementation of a round-robin scheme for disk allocation for creating
  * files. The way it works is that it is kept track what disk was last
@@ -192,12 +193,13 @@ public class LocalDirAllocator {
       LogFactory.getLog(AllocatorPerContext.class);
 
     private int dirNumLastAccessed;
+    private long lastReloadTimestamp = 0;
     private Random dirIndexRandomizer = new Random();
     private FileSystem localFS;
     private DF[] dirDF;
     private String contextCfgItemName;
     private String[] localDirs;
-    private String savedLocalDirs = "";
+    private String savedLocalDirs;
 
     public AllocatorPerContext(String contextCfgItemName) {
       this.contextCfgItemName = contextCfgItemName;
@@ -207,10 +209,46 @@ public class LocalDirAllocator {
      * that any change to localDirs is reflected immediately.
      */
     private void confChanged(Configuration conf) throws IOException {
-      String newLocalDirs = conf.get(contextCfgItemName);
+      String configFilePath = conf.get("mapred.localdir.confpath");
+      String newLocalDirs = null;
+      String[] localDirsList = null;
+      if ((contextCfgItemName.equals("mapred.local.dir")) && 
+        (configFilePath != null)) {
+        try {
+          DataDirFileReader reader = new DataDirFileReader(configFilePath);
+          if (lastReloadTimestamp < reader.getLastModTimeStamp()) {
+            lastReloadTimestamp = reader.getLastModTimeStamp();
+            String tempLocalDirs = reader.getNewDirectories();
+            localDirsList = reader.getArrayOfCurrentDataDirectories();
+            if(tempLocalDirs == null) {
+              LOG.warn("File is empty, using mapred.local.dir directories");
+            }
+            else {
+              newLocalDirs = tempLocalDirs;
+            }
+          } else {
+            newLocalDirs = savedLocalDirs;
+          }
+        } catch (IOException e) {
+          LOG.warn("Could not read file, using directories from mapred.local" +
+                                                         ".dir Exception: ", e);
+        }
+      } else {
+        LOG.warn("No mapred.localdir.confpath not defined, now using default " +
+                                                             "directories");
+      }
+      if (newLocalDirs == null) {
+        newLocalDirs = conf.get(contextCfgItemName);
+      }
+      Configuration newConf = new Configuration(conf);
+      newConf.setLong("dfs.df.interval", 30000);
       if (!newLocalDirs.equals(savedLocalDirs)) {
-        localDirs = conf.getStrings(contextCfgItemName);
-        localFS = FileSystem.getLocal(conf);
+        if (localDirsList != null) {
+          localDirs = localDirsList;
+        } else {
+          localDirs = newConf.getStrings(contextCfgItemName);
+        }
+        localFS = FileSystem.getLocal(newConf);
         int numDirs = localDirs.length;
         ArrayList<String> dirs = new ArrayList<String>(numDirs);
         ArrayList<DF> dfList = new ArrayList<DF>(numDirs);
@@ -222,7 +260,7 @@ public class LocalDirAllocator {
               try {
                 DiskChecker.checkDir(new File(localDirs[i]));
                 dirs.add(localDirs[i]);
-                dfList.add(new DF(new File(localDirs[i]), 30000, conf.getLong("dfs.datanode.du.reserved",0)));
+                dfList.add(new DF(new File(localDirs[i]), newConf));
               } catch (DiskErrorException de) {
                 LOG.warn( localDirs[i] + "is not writable\n" +
                     StringUtils.stringifyException(de));
@@ -241,6 +279,14 @@ public class LocalDirAllocator {
         
         // randomize the first disk picked in the round-robin selection 
         dirNumLastAccessed = dirIndexRandomizer.nextInt(dirs.size());
+      }
+
+      if (localDirs == null) {
+        throw new IllegalStateException("confChanged: Cannot have null " +
+            "localDirs with configFilePath " + configFilePath +
+            ", contextCfgItemName" + conf.get(contextCfgItemName) +
+            ", newLocalDirs " + newLocalDirs + ", savedLocalDirs " +
+            savedLocalDirs);
       }
     }
 
@@ -309,7 +355,8 @@ public class LocalDirAllocator {
 
         // Keep rolling the wheel till we get a valid path
         Random r = new java.util.Random();
-        while (numDirsSearched < numDirs && returnPath == null) {
+        while (numDirsSearched < numDirs && returnPath == null &&
+            totalAvailable > 0) {
           long randomPosition = Math.abs(r.nextLong()) % totalAvailable;
           int dir = 0;
           while (randomPosition > availableOnDisk[dir]) {

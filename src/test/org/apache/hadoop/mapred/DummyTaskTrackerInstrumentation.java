@@ -26,12 +26,19 @@ import java.io.File;
 public class DummyTaskTrackerInstrumentation
   extends TaskTrackerInstrumentation
 {
+  @Override
+  public void diskOutOfSpaceTask(TaskAttemptID t) {
+    diskOutOfSpaceCalled = true;
+  }
+
   boolean completeTaskCalled = false;
   boolean timedoutTaskCalled = false;
   boolean taskFailedPingCalled = false;
   boolean reportTaskLaunchCalled = false;
   boolean reportTaskEndCalled = false;
   boolean statusUpdateCalled = false;
+  boolean unaccountedMemoryCalled = false;
+  boolean diskOutOfSpaceCalled = false;
 
   public DummyTaskTrackerInstrumentation(TaskTracker tt) {
     super(tt);
@@ -65,5 +72,10 @@ public class DummyTaskTrackerInstrumentation
   @Override
   public void statusUpdate(Task t, TaskStatus s) {
     statusUpdateCalled = true;
+  }
+
+  @Override
+  public void unaccountedMemory(long memory) {
+    unaccountedMemoryCalled = true;
   }
 }

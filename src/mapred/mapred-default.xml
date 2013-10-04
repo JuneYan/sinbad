@@ -132,6 +132,17 @@
   </description>
 </property>
 
+<property>	
+ <name>mapred.localdir.confpath</name>	
+ <value></value>	
+ <description>Determines where on the local filesystem on the data node	
+ to locate the config file with the list of working directories. This is an	
+ absolute path to that file and the data is stored in a new line deliminated	
+ file. This allows for a dynamic list of directories without modifying the 	
+ actual config file itself.	
+ </description>	
+</property>
+
 <property>
   <name>mapred.system.dir</name>
   <value>${hadoop.tmp.dir}/mapred/system</value>
@@ -253,6 +264,15 @@
                uses job history, its important to dump job history to disk as
                soon as possible. Note that this is an expert level parameter.
                The default value is set to 3 MB.
+  </description>
+</property>
+
+<property>
+  <name>mapred.max.num.blocks.per.split</name>
+  <value>256</value>
+  <description>The maximum number of blocks per split. Defaults to 256. Used
+               in situations where a single split may contain many small 
+               files, which has some performance implications. 
   </description>
 </property>
 

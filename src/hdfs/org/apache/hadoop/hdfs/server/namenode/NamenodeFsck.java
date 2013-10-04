@@ -38,6 +38,8 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.net.NodeBase;
 import org.apache.hadoop.security.AccessControlException;
+import org.apache.hadoop.util.InjectionHandler;
+import org.apache.hadoop.hdfs.BlockReader;
 import org.apache.hadoop.hdfs.DFSClient;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DataTransferProtocol;
@@ -46,6 +48,7 @@ import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.protocol.FSConstants.DatanodeReportType;
 import org.apache.hadoop.hdfs.server.common.HdfsConstants;
+import org.apache.hadoop.hdfs.util.InjectionEvent;
 import org.apache.hadoop.fs.permission.PermissionStatus;
 
 /**
@@ -117,12 +120,19 @@ public class NamenodeFsck {
    * @throws IOException
    */
   public NamenodeFsck(Configuration conf,
+      NameNode nn,
+      Map<String,String[]> pmap,
+      HttpServletResponse response) throws IOException {
+    this(conf, nn, pmap, response.getWriter());
+  }
+  
+  public NamenodeFsck(Configuration conf,
                       NameNode nn,
                       Map<String,String[]> pmap,
-                      HttpServletResponse response) throws IOException {
+                      PrintWriter writer) throws IOException {
     this.conf = conf;
     this.nn = nn;
-    this.out = response.getWriter();
+    this.out = writer;
     for (Iterator<String> it = pmap.keySet().iterator(); it.hasNext();) {
       String key = it.next();
       if (key.equals("path")) { this.path = pmap.get("path")[0]; }
@@ -149,12 +159,17 @@ public class NamenodeFsck {
    * @throws Exception
    */
   public void fsck() throws IOException {
+    InjectionHandler.processEvent(InjectionEvent.NAMENODE_FSCK_START);
+    
     try {
       FileStatus[] files = nn.namesystem.dir.getListing(path);
       FsckResult res = new FsckResult();
-      res.totalRacks = nn.getNetworkTopology().getNumOfRacks();
-      res.totalDatanodes = nn.namesystem.getNumberOfDatanodes(
-        DatanodeReportType.LIVE);
+      if (!this.showFiles && !this.showBlocks && !this.showLocations
+          && !this.showRacks) {
+        res.totalRacks = nn.getNetworkTopology().getNumOfRacks();
+        res.totalDatanodes = nn.namesystem
+            .getNumberOfDatanodes(DatanodeReportType.LIVE);
+      }
       res.setReplication((short) conf.getInt("dfs.replication", 3));
       if (files != null) {
         if (showCorruptFileBlocks && showOpenFiles) {
@@ -454,7 +469,7 @@ public class NamenodeFsck {
   
   private void lostFoundMove(FileStatus file, LocatedBlocks blocks)
     throws IOException {
-    final DFSClient dfs = new DFSClient(NameNode.getAddress(conf), conf);
+    final DFSClient dfs = new DFSClient(NameNode.getClientProtocolAddress(conf), conf);
     try {
     if (!lfInited) {
       lostFoundInit(dfs);
@@ -531,7 +546,7 @@ public class NamenodeFsck {
     InetSocketAddress targetAddr = null;
     TreeSet<DatanodeInfo> deadNodes = new TreeSet<DatanodeInfo>();
     Socket s = null;
-    DFSClient.BlockReader blockReader = null; 
+    BlockReader blockReader = null; 
     Block block = lblock.getBlock(); 
 
     while (s == null) {
@@ -559,8 +574,8 @@ public class NamenodeFsck {
         s.setSoTimeout(HdfsConstants.READ_TIMEOUT);
         
         blockReader = 
-          DFSClient.BlockReader.newBlockReader(DataTransferProtocol.DATA_TRANSFER_VERSION,
-                                               nn.getNamesystem().getFSImage().namespaceID,
+            BlockReader.newBlockReader(DataTransferProtocol.DATA_TRANSFER_VERSION,
+                                               nn.getNamesystem().getFSImage().storage.namespaceID,
                                                s, targetAddr.toString() + ":" + 
                                                block.getBlockId(), 
                                                block.getBlockId(), 
@@ -684,8 +699,8 @@ public class NamenodeFsck {
     private long totalSize = 0L;
     private long totalOpenFilesSize = 0L;
     private long totalReplicas = 0L;
-    private int totalDatanodes = 0;
-    private int totalRacks = 0;
+    private int totalDatanodes = -1;
+    private int totalRacks = -1;
     
     /**
      * DFS is considered healthy if there are no missing blocks.
@@ -858,8 +873,12 @@ public class NamenodeFsck {
       res.append("\n Corrupt blocks:\t\t" + corruptBlocks);
       res.append("\n Missing replicas:\t\t" + missingReplicas);
       if (totalReplicas > 0)        res.append(" (" + ((float) (missingReplicas * 100) / (float) totalReplicas) + " %)");
-      res.append("\n Number of data-nodes:\t\t" + totalDatanodes);
-      res.append("\n Number of racks:\t\t" + totalRacks);
+      if (totalDatanodes >= 0) {
+        res.append("\n Number of data-nodes:\t\t" + totalDatanodes);
+      }
+      if (totalRacks >= 0) {
+        res.append("\n Number of racks:\t\t" + totalRacks);
+      }
       return res.toString();
     }
     

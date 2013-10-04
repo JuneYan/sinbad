@@ -18,18 +18,32 @@
 
 package org.apache.hadoop.hdfs;
 
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.UnsupportedEncodingException;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
+import java.net.URI;
+import java.net.URL;
+import java.net.URLConnection;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Random;
 import java.util.Set;
 import java.util.HashSet;
 import java.util.Comparator;
 
+import org.apache.commons.logging.Log;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.BlockAndLocation;
 import org.apache.hadoop.fs.BlockLocation;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.FilterFileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.hdfs.protocol.Block;
@@ -38,11 +52,24 @@ import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.server.namenode.NameNode;
+import org.apache.hadoop.hdfs.server.protocol.BlockFlags;
+import org.apache.hadoop.io.UTF8;
 import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.net.NodeBase;
-import org.apache.hadoop.security.UserGroupInformation;
 
 public class DFSUtil {
+  private static final ThreadLocal<Random> RANDOM = new ThreadLocal<Random>() {
+    @Override
+    protected Random initialValue() {
+      return new Random();
+    }
+  };
+  
+  /** @return a pseudo random number generator. */
+  public static Random getRandom() {
+    return RANDOM.get();
+  }
+  
   /**
    * Compartor for sorting DataNodeInfo[] based on decommissioned states.
    * Decommissioned nodes are moved to the end of the array on sorting with
@@ -52,10 +79,18 @@ public class DFSUtil {
     new Comparator<DatanodeInfo>() {
     @Override
     public int compare(DatanodeInfo a, DatanodeInfo b) {
-      return a.isDecommissioned() == b.isDecommissioned() ? 0 :
-        a.isDecommissioned() ? 1 : -1;
+      if (a.isDecommissioned() != b.isDecommissioned()) {
+        return a.isDecommissioned() ? 1 : -1;
+      } else if (a.isSuspectFail() != b.isSuspectFail()) {
+        return a.isSuspectFail() ? 1 : -1;
+      } else {
+        return 0;
+      }
+      
     }
   };
+  
+  private static final String utf8charsetName = "UTF8";
   
   /**
    * Given a list of path components returns a path as a UTF8 String
@@ -66,19 +101,18 @@ public class DFSUtil {
     if (pathComponents.length == 1 && pathComponents[0].length == 0) {
       return Path.SEPARATOR;
     }
-    try {
-      StringBuilder result = new StringBuilder();
-      for (int i = 0; i < pathComponents.length; i++) {
-        result.append(new String(pathComponents[i], "UTF-8"));
-        if (i < pathComponents.length - 1) {
-          result.append(Path.SEPARATOR_CHAR);
-        }
+
+    StringBuilder result = new StringBuilder();
+    for (int i = 0; i < pathComponents.length; i++) {
+      String converted = bytes2String(pathComponents[i]);
+      if (converted == null)
+        return null;
+      result.append(converted);
+      if (i < pathComponents.length - 1) {
+        result.append(Path.SEPARATOR_CHAR);
       }
-      return result.toString();
-    } catch (UnsupportedEncodingException ex) {
-      assert false : "UTF8 encoding is not supported ";
     }
-    return null;
+    return result.toString();
   }
 
   /**
@@ -93,29 +127,62 @@ public class DFSUtil {
     return bytes2byteArray(bytes, bytes.length, separator);
   }
 
-   /**
-    * Converts a byte array to a string using UTF8 encoding.
-    */
-   public static String bytes2String(byte[] bytes) {
-     try {
-       return new String(bytes, "UTF8");
-     } catch(UnsupportedEncodingException e) {
-       assert false : "UTF8 encoding is not supported ";
-     }
-     return null;
-   }
-
-   /**
-    * Converts a string to a byte array using UTF8 encoding.
-    */
-   public static byte[] string2Bytes(String str) {
-     try {
-       return str.getBytes("UTF8");
-     } catch(UnsupportedEncodingException e) {
-       assert false : "UTF8 encoding is not supported ";
-     }
-     return null;
-   }
+  /**
+   * Converts a byte array to a string using UTF8 encoding. 
+   */
+  public static String bytes2String(byte[] bytes) {
+    try {
+      final int len = bytes.length;
+      char[] charArray = UTF8.getCharArray(len);
+      for (int i = 0; i < bytes.length; i++) {
+        if (bytes[i] < UTF8.MIN_ASCII_CODE) {
+          // non-ASCII codepoints' higher bytes
+          // are of the form (10xxxxxx), hence the bytes
+          // represent a non-ASCII string
+          // do expensive conversion
+          return new String(bytes, utf8charsetName);
+        }
+        // copy to temporary array
+        charArray[i] = (char) bytes[i];
+      }
+      // only ASCII bytes, do fast conversion
+      // using bytes as actual characters
+      return new String(charArray, 0, len);
+    } catch (UnsupportedEncodingException e) {
+      assert false : "UTF8 encoding is not supported ";
+    }
+    return null;
+  }
+   
+  /**
+   * Converts a string to a byte array using UTF8 encoding. 
+   */
+  public static byte[] string2Bytes(String str) {
+    try {
+      final int len = str.length();
+      // if we can, we will use it to return the bytes
+      byte[] rawBytes = new byte[len];
+      
+      // get all chars of the given string
+      char[] charArray = UTF8.getCharArray(len);
+      str.getChars(0, len, charArray, 0);
+      
+      for (int i = 0; i < len; i++) {
+        if (charArray[i] > UTF8.MAX_ASCII_CODE) {
+          // non-ASCII chars present
+          // do expensive conversion
+          return str.getBytes(utf8charsetName);
+        }
+        // copy to output array
+        rawBytes[i] = (byte) charArray[i];
+      }
+      // only ASCII present - return raw bytes
+      return rawBytes;
+    } catch (UnsupportedEncodingException e) {
+      assert false : "UTF8 encoding is not supported ";
+    }
+    return null;
+  }
 
   /**
    * Splits first len bytes in bytes to array of arrays of bytes on byte
@@ -145,7 +212,7 @@ public class DFSUtil {
       splits--;
     }
     if (splits == 0 && bytes[0] == separator) {
-      return new byte[][] { null };
+      return new byte[][] { new byte[0] };
     }
     splits++;
     byte[][] result = new byte[splits][];
@@ -166,8 +233,107 @@ public class DFSUtil {
     }
     return result;
   }
+  
+  /**
+   * An implementation of the String.split(String);
+   */
+  public static String[] split(String str, char separator) {
+    final int len;
+    if (str == null 
+        || ((len = str.length()) == 0)) {
+      return null;
+    }
+
+    List<String> componentList = new ArrayList<String>();
+    int startIndex = 0;
+
+    for (int i = 0; i < len; i++) {
+      if (str.charAt(i) == separator) {
+        componentList.add(str.substring(startIndex, i));
+        startIndex = i + 1;
+      }
+    }
+
+    if (str.charAt(len - 1) != separator) {
+      componentList.add(str.substring(startIndex, len));
+    }
+
+    return componentList.toArray(new String[componentList.size()]);
+  }
+
+  public static byte[][] splitAndGetPathComponents(String str) {
+    try {
+      final int len;
+      if (str == null 
+          || ((len = str.length()) == 0)
+          || str.charAt(0) != Path.SEPARATOR_CHAR) {
+        return null;
+      }
+  
+      char[] charArray = UTF8.getCharArray(len);
+      str.getChars(0, len, charArray, 0);
+      
+      // allocate list for components
+      List<byte[]> componentByteList = new ArrayList<byte[]>(20);
+  
+      // for each component to know if it has only ascii chars
+      boolean canFastConvert = true;
+      int startIndex = 0;
+  
+      for (int i = 0; i < len; i++) {
+        if (charArray[i] == Path.SEPARATOR_CHAR) {
+          componentByteList.add(extractBytes(str, startIndex, i, charArray,
+              canFastConvert));
+          startIndex = i + 1;
+          // assume only ASCII chars
+          canFastConvert = true;
+        } else if (charArray[i] > UTF8.MAX_ASCII_CODE) {
+          // found non-ASCII char, we will do 
+          // full conversion for this component
+          canFastConvert = false;
+        }
+      }
+      // the case when the last component is a filename ("/" not at the end)
+      if (charArray[len - 1] != Path.SEPARATOR_CHAR) {
+        componentByteList.add(extractBytes(str, startIndex, len, charArray,
+            canFastConvert));
+      }
+      int last = componentByteList.size(); // last split
+      while (--last>=1 && componentByteList.get(last).length == 0) {
+        componentByteList.remove(last);
+      }
+      return componentByteList.toArray(new byte[last+1][]);
+    } catch (UnsupportedEncodingException e) {
+      return null;
+    }
+  }
 
   /**
+   * Helper for extracting bytes either from "str"
+   * or from the array of chars "charArray",
+   * depending if fast conversion is possible,
+   * specified by "canFastConvert"
+   */  
+  private static byte[] extractBytes(
+      String str, 
+      int startIndex, 
+      int endIndex,
+      char[] charArray, 
+      boolean canFastConvert) throws UnsupportedEncodingException {
+    if (canFastConvert) {
+      // fast conversion, just copy the raw bytes
+      final int len = endIndex - startIndex;
+      byte[] strBytes = new byte[len];
+      for (int i = 0; i < len; i++) {
+        strBytes[i] = (byte) charArray[startIndex + i];
+      }
+      return strBytes;
+    } 
+    // otherwise, do expensive conversion
+    return str.substring(startIndex, endIndex).getBytes(utf8charsetName);
+  }
+  
+   /**
    * Convert a LocatedBlocks to BlockLocations[]
    * @param blocks a LocatedBlocks
    * @return an array of BlockLocations
@@ -204,6 +370,48 @@ public class DFSUtil {
     return blkLocations;
   }
 
+  
+  /**
+  * Convert a LocatedBlocks to BlockAndLocations[]
+  * @param blocks a LocatedBlocks
+  * @return an array of BlockLocations
+  */
+ public static BlockAndLocation[] locatedBlocks2BlockLocations(
+     LocatedBlocks blocks) {
+   if (blocks == null) {
+     return new BlockAndLocation[0];
+   }
+   int nrBlocks = blocks.locatedBlockCount();
+   BlockAndLocation[] blkLocations = new BlockAndLocation[nrBlocks];
+   if (nrBlocks == 0) {
+     return blkLocations;
+   }
+   int idx = 0;
+   for (LocatedBlock blk : blocks.getLocatedBlocks()) {
+     assert idx < nrBlocks : "Incorrect index";
+     DatanodeInfo[] locations = blk.getLocations();
+     String[] hosts = new String[locations.length];
+     String[] names = new String[locations.length];
+     String[] racks = new String[locations.length];
+     for (int hCnt = 0; hCnt < locations.length; hCnt++) {
+       hosts[hCnt] = locations[hCnt].getHostName();
+       names[hCnt] = locations[hCnt].getName();
+       NodeBase node = new NodeBase(names[hCnt],
+                                    locations[hCnt].getNetworkLocation());
+       racks[hCnt] = node.toString();
+     }
+     Block block = blk.getBlock();
+     blkLocations[idx] = new BlockAndLocation(block.getBlockId(),
+                                           block.getGenerationStamp(),
+                                           names, hosts, racks,
+                                           blk.getStartOffset(),
+                                           block.getNumBytes(),
+                                           blk.isCorrupt());
+     idx++;
+   }
+   return blkLocations;
+ }
+
   /**
    * @return all corrupt files in dfs
    */
@@ -229,13 +437,12 @@ public class DFSUtil {
   /**
    * Check if it is a deleted block or not
    */
-  public final static long DELETED = Long.MAX_VALUE - 1;
   public static boolean isDeleted(Block block) {
-    return block.getNumBytes() == DELETED;
+    return block.getNumBytes() == BlockFlags.DELETED;
   }
   
   public static void markAsDeleted(Block block) {
-    block.setNumBytes(DELETED);
+    block.setNumBytes(BlockFlags.DELETED);
   }
 
   /**
@@ -284,6 +491,48 @@ public class DFSUtil {
   public static List<InetSocketAddress> getAddresses(Configuration conf,
       String defaultAddress, String... keys) {
     return getAddresses(conf, getNameServiceIds(conf), defaultAddress, keys);
+  }
+  
+  /**
+   * Returns list of InetSocketAddresses corresponding to namenodes from the
+   * configuration. 
+   * @param suffix 0 or 1 indicating if this is AN0 or AN1
+   * @param conf configuration
+   * @param keys Set of keys
+   * @return list of InetSocketAddress
+   * @throws IOException on error
+   */
+  public static List<InetSocketAddress> getRPCAddresses(String suffix,
+      Configuration conf, Collection<String> serviceIds, String... keys) 
+          throws IOException {
+    // Use default address as fall back
+    String defaultAddress = null;
+    try {
+      defaultAddress = conf.get(FileSystem.FS_DEFAULT_NAME_KEY + suffix);
+      if (defaultAddress != null) {
+        defaultAddress = NameNode.getDefaultAddress(conf);
+      }
+    } catch (IllegalArgumentException e) {
+      defaultAddress = null;
+    }
+    
+    for (int i = 0; i < keys.length; i++) {
+      keys[i] += suffix;
+    }
+    
+    List<InetSocketAddress> addressList = DFSUtil.getAddresses(conf,
+        serviceIds, defaultAddress,
+        keys);
+    if (addressList == null) {
+      String keyStr = "";
+      for (String key: keys) {
+        keyStr += key + " ";
+      }
+      throw new IOException("Incorrect configuration: namenode address "
+          + keyStr
+          + " is not configured.");
+    }
+    return addressList;
   }
   
   /**
@@ -377,18 +626,27 @@ public class DFSUtil {
    * @throws IOException on error
    */
   public static List<InetSocketAddress> getClientRpcAddresses(
-      Configuration conf) throws IOException {
-    // Use default address as fall back
-    String defaultAddress;
-    try {
-      defaultAddress = NameNode.getHostPortString(NameNode.getAddress(conf));
-    } catch (IllegalArgumentException e) {
-      defaultAddress = null;
-    }
-    
-    List<InetSocketAddress> addressList = getAddresses(conf, defaultAddress,
+      Configuration conf, Collection<String> suffixes) throws IOException {
+
+    List<InetSocketAddress> addressList; 
+    if(suffixes != null && !suffixes.isEmpty()){
+      addressList = new ArrayList<InetSocketAddress>();
+      for (String s : suffixes) {
+        addressList.addAll(getRPCAddresses(s, conf, getNameServiceIds(conf),
+            FSConstants.DFS_NAMENODE_RPC_ADDRESS_KEY));
+      }
+    } else {
+      // Use default address as fall back
+      String defaultAddress;
+      try {
+        defaultAddress = NameNode.getDefaultAddress(conf);
+      } catch (IllegalArgumentException e) {
+        defaultAddress = null;
+      }
+      addressList = getAddresses(conf, defaultAddress,
         FSConstants.DFS_NAMENODE_RPC_ADDRESS_KEY);
-    if (addressList == null) {
+    }
+    if (addressList == null || addressList.isEmpty()) {
       throw new IOException("Incorrect configuration: namenode address "
           + FSConstants.DFS_NAMENODE_RPC_ADDRESS_KEY
           + " is not configured.");
@@ -414,7 +672,7 @@ public class DFSUtil {
     // Use default address as fall back
     String defaultAddress;
     try {
-      defaultAddress = NameNode.getHostPortString(NameNode.getAddress(conf));
+      defaultAddress = NameNode.getDefaultAddress(conf);
     } catch (IllegalArgumentException e) {
       defaultAddress = null;
     }
@@ -481,32 +739,73 @@ public class DFSUtil {
    * return server http address from the configuration
    * @param conf
    * @param namenode - namenode address
+   * @param isAvatar - whether it's avatar config
    * @return server http
    */
   public static String getInfoServer(
-      InetSocketAddress namenode, Configuration conf) {
+      InetSocketAddress namenode, Configuration conf, boolean isAvatar) {
     String httpAddressDefault = 
         NetUtils.getServerAddress(conf, "dfs.info.bindAddress", 
                                   "dfs.info.port", "dfs.http.address"); 
     String httpAddress = null;
     if(namenode != null) {
-      // if non-default namenode, try reverse look up 
-      // the nameServiceID if it is available
-      String nameServiceId = DFSUtil.getNameServiceIdFromAddress(
-          conf, namenode,
-          FSConstants.DFS_NAMENODE_RPC_ADDRESS_KEY);
+      if (!isAvatar) {
+        // if non-default namenode, try reverse look up 
+        // the nameServiceID if it is available
+        String nameServiceId = DFSUtil.getNameServiceIdFromAddress(
+            conf, namenode,
+            FSConstants.DFS_NAMENODE_RPC_ADDRESS_KEY);
 
-      if (nameServiceId != null) {
-        httpAddress = conf.get(DFSUtil.getNameServiceIdKey(
-            FSConstants.DFS_NAMENODE_HTTP_ADDRESS_KEY, nameServiceId));
+        if (nameServiceId != null) {
+          httpAddress = conf.get(DFSUtil.getNameServiceIdKey(
+              FSConstants.DFS_NAMENODE_HTTP_ADDRESS_KEY, nameServiceId));
+        }
+      } else {
+        // federated, avatar addresses
+        String suffix = "0";
+        String nameServiceId = DFSUtil.getNameServiceIdFromAddress(
+            conf, namenode,
+            FSConstants.DFS_NAMENODE_RPC_ADDRESS_KEY + "0");
+        if (nameServiceId == null) {
+          nameServiceId = DFSUtil.getNameServiceIdFromAddress(
+              conf, namenode,
+              FSConstants.DFS_NAMENODE_RPC_ADDRESS_KEY + "1");
+          suffix = "1";
+        }
+        if (nameServiceId != null) {
+          httpAddress = conf.get(DFSUtil.getNameServiceIdKey(
+              FSConstants.DFS_NAMENODE_HTTP_ADDRESS_KEY + suffix, nameServiceId));
+        }
+        
+        // federated, avatar addresses - ok
+        if (httpAddress != null) {
+          return httpAddress;
+        }
+        
+        // non-federated, avatar adresses
+        httpAddress = getNonFederatedAvatarInfoServer(namenode, "0", conf);
+        if (httpAddress != null) {
+          return httpAddress;
+        }
+        httpAddress = getNonFederatedAvatarInfoServer(namenode, "1", conf);     
       }
     }
-    // else - Use non-federation style configuration
-    if (httpAddress == null) {
-      httpAddress = conf.get("dfs.http.address", httpAddressDefault);
-    }
 
+    // else - Use non-federation, non-avatar configuration
+    if (httpAddress == null) {
+      httpAddress = conf.get(FSConstants.DFS_NAMENODE_HTTP_ADDRESS_KEY, httpAddressDefault);
+    }
     return httpAddress;
+  }
+  
+  private static String getNonFederatedAvatarInfoServer(
+      InetSocketAddress namenode, String suffix, Configuration conf) {
+    String rpcAddress = conf.get("fs.default.name" + suffix);
+    if (rpcAddress != null && !rpcAddress.isEmpty()
+        && NetUtils.createSocketAddr(rpcAddress).equals(namenode)) {
+      return conf.get(FSConstants.DFS_NAMENODE_HTTP_ADDRESS_KEY + suffix);
+    }
+    return null;
   }
   
   /**
@@ -582,5 +881,93 @@ public class DFSUtil {
     }
     return new InetSocketAddress(address.substring(0, colon),
       Integer.parseInt(address.substring(colon + 1)));
+  }
+
+  public static DistributedFileSystem convertToDFS(FileSystem fs) {
+    // for RaidDFS
+    if (fs instanceof FilterFileSystem) {
+      fs = ((FilterFileSystem) fs).getRawFileSystem();
+    }
+    if (fs instanceof DistributedFileSystem)
+      return (DistributedFileSystem) fs;
+    else
+      return null;
+  }
+  
+  /*
+   * Connect to the some url to get the html content
+   */
+  public static String getHTMLContent(URI uri) throws IOException,
+      SocketTimeoutException {
+    return getHTMLContentWithTimeout(uri.toURL(), 0, 0); 
+  }
+  
+  public static String getHTMLContentWithTimeout(URL path, int connectTimeout, 
+      int readTimeout) throws IOException, SocketTimeoutException  {
+    InputStream stream = null;
+    URLConnection connection = path.openConnection();
+    if (connectTimeout > 0) {
+      connection.setConnectTimeout(connectTimeout);
+    }
+    if (readTimeout > 0) {
+      connection.setReadTimeout(readTimeout);
+    }
+    stream = connection.getInputStream();
+    BufferedReader input = new BufferedReader(
+        new InputStreamReader(stream));
+    StringBuilder sb = new StringBuilder();
+    String line = null;
+    try {
+      while (true) {
+        line = input.readLine();
+        if (line == null) {
+          break;
+        }
+        sb.append(line + "\n");
+      }
+      return sb.toString();
+    } finally {
+      input.close();
+    }
+  }
+  
+  /**
+   * Given the start time in nano seconds, return the elapsed time in
+   * microseconds.
+   */
+  public static long getElapsedTimeMicroSeconds(long start) {
+    return (System.nanoTime() - start) / 1000;
+  }
+  
+  public static String getStackTrace() {
+    StringBuilder sb = new StringBuilder();
+    sb.append("------------------------------------\n");
+    sb.append("Current stack trace:\n\n");
+    StackTraceElement[] trace = Thread.currentThread().getStackTrace();    
+    for(StackTraceElement se : trace) {
+      sb.append(se + "\n");
+    }
+    return sb.toString();   
+  }
+
+  public static void throwAndLogIllegalState(String message, Log LOG) {
+    IllegalStateException ise = new IllegalStateException(message);
+    LOG.error(ise);
+    throw ise;
+  }
+  
+  public static String getAllStackTraces() {
+    StringBuilder sb = new StringBuilder();
+    sb.append("------------------------------------\n");
+    sb.append("All stack traces:\n\n");
+    Map<Thread, StackTraceElement[]> traces = Thread.getAllStackTraces();    
+    for(Entry<Thread, StackTraceElement[]> e : traces.entrySet()) {
+      sb.append("------------------------------------\n");
+      sb.append(e.getKey() + "\n\n");
+      for(StackTraceElement se : e.getValue()) {
+        sb.append(se + "\n");
+      }
+    }
+    return sb.toString();   
   }
 }

@@ -27,7 +27,7 @@
 
   <property name="Name" value="Facebook's unified version of Apache Hadoop"/>
   <property name="name" value="hadoop"/>
-  <property name="version" value="0.20.1-dev"/>
+  <property name="version" value="0.20"/>
   <property name="final.name" value="${name}-${version}"/>
   <property name="year" value="2009"/>
 
@@ -60,6 +60,9 @@
   <property name="build.examples" value="${build.dir}/examples"/>
   <property name="build.anttasks" value="${build.dir}/ant"/>
   <property name="build.librecordio" value="${build.dir}/librecordio"/>
+  <property name="configerator.lib" location="${basedir}/src/native/lib/configerator"/>
+  <property name="userGroupInfo.lib" location="${basedir}/src/native/lib/userGroupInfo"/>
+  <property name="cgroup.lib" location="${basedir}/src/native/lib/cgroup"/>
   <!-- convert spaces to _ so that mac os doesn't break things -->
   <exec executable="sed" inputstring="${os.name}"
         outputproperty="nonspace.os">
@@ -107,7 +110,7 @@
   <property name="test.junit.fork.mode" value="perTest" />
   <property name="test.junit.printsummary" value="yes" />
   <property name="test.junit.haltonfailure" value="no" />
-  <property name="test.junit.maxmemory" value="512m" />
+  <property name="test.junit.maxmemory" value="1024m" />
   <property name="test.tools.input.dir" value="${basedir}/src/test/tools/data"/>
   <!-- The default user.home might have lots of dirs that will slow down
        tets that scan user.home, so allow a way to specify a custom,
@@ -132,7 +135,9 @@
   <property name="javac.deprecation" value="off"/>
   <property name="javac.version" value="1.6"/>
   <property name="javac.args" value=""/>
-  <property name="javac.args.warnings" value="-Xlint:unchecked"/>
+  <!-- NOTE: -XDignore.symbol.file removes annoying warning about use
+       of proprietary sun.misc.Unsafe -->
+  <property name="javac.args.warnings" value="-Xlint:unchecked -XDignore.symbol.file"/>
 
   <property name="clover.db.dir" location="${build.dir}/test/clover/db"/>
   <property name="clover.report.dir" location="${build.dir}/test/clover/reports"/>
@@ -201,15 +206,15 @@
   <property name="common.ivy.lib.dir" location="${build.ivy.lib.dir}/${ant.project.name}/common"/>
   <property name="build.ivy.report.dir" location="${build.ivy.dir}/report" />
   <property name="build.ivy.maven.dir" location="${build.ivy.dir}/maven" />
-  <property name="build.ivy.maven.pom" location="${build.ivy.maven.dir}/hadoop-core-${hadoop.version}.pom" />
-  <property name="build.ivy.maven.jar" location="${build.ivy.maven.dir}/hadoop-core-${hadoop.version}.jar" />
+  <property name="build.ivy.maven.pom" location="${build.ivy.maven.dir}/hadoop-core-${version}.pom" />
+  <property name="build.ivy.maven.jar" location="${build.ivy.maven.dir}/hadoop-core-${version}.jar" />
 
   <!--this is the naming policy for artifacts we want pulled down-->
   <property name="ivy.artifact.retrieve.pattern" value="${ant.project.name}/[conf]/[artifact]-[revision].[ext]"/>
 
   <!--this is how artifacts that get built are named-->
   <property name="ivy.publish.pattern" value="hadoop-[revision]-core.[ext]"/>
-  <property name="hadoop.jar" location="${build.dir}/hadoop-${hadoop.version}-core.jar" />
+  <property name="hadoop.jar" location="${build.dir}/hadoop-${version}-core.jar" />
 
   <!-- jdiff.home property set -->
   <property name="jdiff.home" value="${build.ivy.lib.dir}/${ant.project.name}/jdiff"/>
@@ -226,6 +231,18 @@
         <isset property="clover.present"/>
     </and>
   </condition>
+
+  <!-- Indicate is Snappy native library should be bundled with Hadoop or not -->
+  <property name="bundle.snappy" value="true"/>
+
+  <!-- Snappy native library location -->
+  <property name="snappy.prefix" value="${native.src.dir}/lib/snappy"/>
+  <property name="configerator.lib" value="${native.src.dir}/lib/configerator"/>
+  <property name="userGroupInfo.lib" value="${native.src.dir}/lib/userGroupInfo"/>
+  <property name="snappy.lib" value="${snappy.prefix}/lib"/>
+  <property name="snappy.include" value="${snappy.prefix}/include"/>
+  <property name="cgroup.prefix" value="${native.src.dir}/lib/cgroup"/>
+  <property name="cgroup.lib" value="${native.src.dir}/lib/cgroup"/>
 
   <!-- the normal classpath -->
   <path id="classpath">
@@ -288,7 +305,9 @@
     <mkdir dir="${build.tools}"/>
     <mkdir dir="${build.src}"/>
     <mkdir dir="${build.webapps}/task/WEB-INF"/>
+    <mkdir dir="${build.webapps}/qjm/WEB-INF"/>
     <mkdir dir="${build.webapps}/job/WEB-INF"/>
+    <mkdir dir="${build.webapps}/jmx/WEB-INF"/>
     <mkdir dir="${build.webapps}/hdfs/WEB-INF"/>
     <mkdir dir="${build.webapps}/datanode/WEB-INF"/>
     <mkdir dir="${build.webapps}/secondary/WEB-INF"/>
@@ -342,6 +361,7 @@
 
   <target name="compile-rcc-compiler" depends="init, record-parser">
     <javac
+        includeantruntime="true"
         encoding="${build.encoding}"
         srcdir="${core.src.dir}"
         includes="org/apache/hadoop/record/compiler/**/*.java"
@@ -366,6 +386,7 @@
      </taskdef>
     <!-- Compile Java files (excluding JSPs) checking warnings -->
     <javac
+     includeantruntime="true"
      encoding="${build.encoding}"
      srcdir="${core.src.dir}"
      includes="org/apache/hadoop/**/*.java"
@@ -403,6 +424,7 @@
 
     <!-- Compile Java files (excluding JSPs) checking warnings -->
     <javac
+     includeantruntime="true"
      encoding="${build.encoding}"
      srcdir="${mapred.src.dir};${build.src}"
      includes="org/apache/hadoop/**/*.java"
@@ -437,8 +459,16 @@
      webxml="${build.webapps}/datanode/WEB-INF/web.xml">
     </jsp-compile>
 
+    <jsp-compile
+     uriroot="${src.webapps}/qjm"
+     outputdir="${build.src}"
+     package="org.apache.hadoop.hdfs.qjournal.server"
+     webxml="${build.webapps}/qjm/WEB-INF/web.xml">
+    </jsp-compile>
+
     <!-- Compile Java files (excluding JSPs) checking warnings -->
     <javac
+     includeantruntime="true"
      encoding="${build.encoding}"
      srcdir="${hdfs.src.dir};${build.src}"
      includes="org/apache/hadoop/**/*.java"
@@ -460,6 +490,7 @@
 
   <target name="compile-tools" depends="init">
     <javac
+     includeantruntime="true"
      encoding="${build.encoding}"
      srcdir="${tools.src}"
      includes="org/apache/hadoop/**/*.java"
@@ -492,8 +523,12 @@
 
     <mkdir dir="${build.native}/lib"/>
     <mkdir dir="${build.native}/src/org/apache/hadoop/io/compress/zlib"/>
+    <mkdir dir="${build.native}/src/org/apache/hadoop/io/compress/snappy"/>
     <mkdir dir="${build.native}/src/org/apache/hadoop/io/compress/lzma"/>
+    <mkdir dir="${build.native}/src/org/apache/hadoop/io/compress/lz4"/>
     <mkdir dir="${build.native}/src/org/apache/hadoop/syscall"/>
+    <mkdir dir="${build.native}/src/org/apache/hadoop/util"/>
+    <mkdir dir="${build.native}/src/org/apache/hadoop/io/nativeio"/>
 
     <javah
       classpath="${build.classes}"
@@ -517,6 +552,27 @@
 
     <javah
       classpath="${build.classes}"
+      destdir="${build.native}/src/org/apache/hadoop/io/compress/lz4"
+      force="yes"
+      verbose="yes"
+      >
+      <class name="org.apache.hadoop.io.compress.lz4.Lz4Compressor" />
+      <class name="org.apache.hadoop.io.compress.lz4.Lz4Decompressor" />
+    </javah>
+
+    <echo> Running javah NativeIO.java  </echo>
+    <javah
+      classpath="${build.classes}"
+      destdir="${build.native}/src/org/apache/hadoop/io/nativeio"
+      force="yes"
+      verbose="yes"
+      >
+      <class name="org.apache.hadoop.io.nativeio.NativeIO" />
+    </javah>
+
+    <echo> Running javah LinuxSystemCall.java  </echo>
+    <javah
+      classpath="${build.classes}"
       destdir="${build.native}/src/org/apache/hadoop/syscall"
       force="yes"
       verbose="yes"
@@ -524,13 +580,45 @@
       <class name="org.apache.hadoop.syscall.LinuxSystemCall" />
     </javah>
 
+    <echo> Running javah bulk_crc32.java  </echo>
+    <javah
+      classpath="${build.classes}"
+      destdir="${build.native}/src/org/apache/hadoop/util"
+      force="yes"
+      verbose="yes"
+      >
+      <class name="org.apache.hadoop.util.NativeCrc32" />
+    </javah>
+
+    <echo> Running javah NativeJerasure.java  </echo>
+    <javah
+      classpath="${build.classes}"
+      destdir="${build.native}/src/org/apache/hadoop/util"
+      force="yes"
+      verbose="yes"
+      >
+      <class name="org.apache.hadoop.util.NativeJerasure" />
+    </javah>
+
     <exec dir="${build.native}" executable="sh" failonerror="true">
       <env key="OS_NAME" value="${os.name}"/>
       <env key="OS_ARCH" value="${os.arch}"/>
       <env key="JVM_DATA_MODEL" value="${sun.arch.data.model}"/>
       <env key="HADOOP_NATIVE_SRCDIR" value="${native.src.dir}"/>
-      <arg line="${native.src.dir}/configure LDFLAGS='-L${basedir}/nativelib/lzma' CPPFLAGS='-I${basedir}/nativelib/lzma'"/>
-    </exec>
+      <arg line="${native.src.dir}/configure 
+          LDFLAGS='-L${snappy.lib} -L${basedir}/nativelib/lzma -L${basedir}/nativelib/lz4 -lrt'
+          CPPFLAGS='-I${snappy.include} -I${basedir}/nativelib/lzma -I${basedir}/nativelib/lz4'"/>
+  	</exec>
+
+    <javah
+       classpath="${build.classes}"
+       destdir="${build.native}/src/org/apache/hadoop/io/compress/snappy"
+       force="yes"
+       verbose="yes"
+       >
+      <class name="org.apache.hadoop.io.compress.snappy.SnappyCompressor"/>
+      <class name="org.apache.hadoop.io.compress.snappy.SnappyDecompressor"/>
+    </javah>
 
     <exec dir="${build.native}" executable="${make.cmd}" failonerror="true">
       <env key="OS_NAME" value="${os.name}"/>
@@ -539,8 +627,23 @@
       <env key="HADOOP_NATIVE_SRCDIR" value="${native.src.dir}"/>
     </exec>
 
-    <exec dir="${build.native}" executable="sh" failonerror="true">
-      <arg line="${build.native}/libtool --mode=install cp ${build.native}/lib/libhadoop.la ${build.native}/lib"/>
+    <delete>
+      <fileset dir="${build.native}/lib" includes="libsnappy.*"/> 
+    </delete>
+    <copy todir="${build.native}/lib">
+      <fileset dir="${snappy.lib}" includes="libsnappy.*"/>
+      <fileset dir="${build.native}/src/org/apache/hadoop/io/compress/snappy/.libs/" includes="libhadoopsnappy.*"/>
+    </copy>
+
+    <copy todir="${build.native}/lib">
+      <fileset dir="${userGroupInfo.lib}" includes="libGetUserGroupInfo.*"/>
+    </copy>
+    <copy todir="${build.native}/lib">
+      <fileset dir="${cgroup.lib}" includes="libCGroupEventListener.*"/>
+    </copy>
+
+  	<exec dir="${build.native}" executable="sh" failonerror="true">
+  	  <arg line="${build.native}/libtool --mode=install cp ${build.native}/lib/libhadoop.la ${build.native}/lib"/>
     </exec>
     <delete>
       <fileset dir="${build.native}/lib" includes="liblzma.so*"/>
@@ -548,6 +651,12 @@
     <copy file="${basedir}/nativelib/lzma/liblzma.so" tofile="${build.native}/lib/liblzma.so"/>
     <copy file="${basedir}/nativelib/lzma/liblzma.so" tofile="${build.native}/lib/liblzma.so.0"/>
     <copy file="${basedir}/nativelib/lzma/liblzma.so" tofile="${build.native}/lib/liblzma.so.5"/>
+    <delete>
+      <fileset dir="${build.native}/lib" includes="liblz4.so*"/>
+    </delete>
+    <copy file="${basedir}/nativelib/lz4/liblz4.so" tofile="${build.native}/lib/liblz4.so"/>
+    <copy file="${basedir}/nativelib/lz4/liblz4.so" tofile="${build.native}/lib/liblz4.so.0"/>
+    <copy file="${basedir}/nativelib/lz4/liblz4.so" tofile="${build.native}/lib/liblz4.so.5"/>
   </target>
 
   <target name="compile-core"
@@ -559,6 +668,7 @@
   <target name="compile-contrib" depends="compile-core,tools-jar,compile-c++-libhdfs">
      <subant target="compile">
         <property name="version" value="${version}"/>
+        <property name="javac.version" value="${javac.version}"/>
         <fileset file="${contrib.dir}/build.xml"/>
      </subant>
   </target>
@@ -569,6 +679,7 @@
   <target name="compile-examples"
           depends="compile-core,compile-tools,compile-c++-examples">
     <javac
+     includeantruntime="true"
      encoding="${build.encoding}"
      srcdir="${examples.dir}"
      includes="org/apache/hadoop/**/*.java"
@@ -605,10 +716,29 @@
         </section>
       </manifest>
       <fileset file="${conf.dir}/commons-logging.properties"/>
-      <fileset file="${conf.dir}/log4j.properties"/>
       <fileset file="${conf.dir}/hadoop-metrics.properties"/>
       <zipfileset dir="${build.webapps}" prefix="webapps"/>
     </jar>
+  </target>
+
+  <target name="jar-source" description="Make sources.jar">
+    <jar jarfile="${build.dir}/${final.name}-sources.jar">
+      <manifest>
+        <section name="org/apache/hadoop">
+          <attribute name="Implementation-Title" value="Hadoop"/>
+          <attribute name="Implementation-Version" value="${version}"/>
+          <attribute name="Implementation-Vendor" value="Facebook"/>
+        </section>
+      </manifest>
+      <fileset dir="${src.dir}/core" includes="*/**"/>
+      <fileset dir="${src.dir}/hdfs/" includes="*/**"/>
+      <fileset dir="${src.dir}/mapred/" includes="*/**"/>
+      <fileset dir="${src.dir}/native/src" includes="*/**"/>
+    </jar>
+    <subant target="jar-source">
+      <property name="version" value="${version}"/>
+      <fileset file="${contrib.dir}/build.xml"/>
+    </subant>
   </target>
 
   <!-- ================================================================== -->
@@ -662,6 +792,7 @@
   <!-- ================================================================== -->
   <target name="compile-core-test" depends="compile-examples, compile-tools, generate-test-records">
     <javac
+     includeantruntime="true"
      encoding="${build.encoding}"
      srcdir="${test.generated.dir}"
      includes="org/apache/hadoop/**/*.java"
@@ -675,6 +806,7 @@
       <classpath refid="test.classpath"/>
     </javac>
     <javac
+     includeantruntime="true"
      encoding="${build.encoding}"
      srcdir="${test.src.dir}"
      includes="org/apache/hadoop/**/*.java"
@@ -688,6 +820,7 @@
       <classpath refid="test.classpath"/>
     </javac>
     <javac
+     includeantruntime="true"
      encoding="${build.encoding}"
      srcdir="${test.src.dir}/testjar"
      includes="*.java"
@@ -705,6 +838,7 @@
      basedir="${test.build.testjar}">
     </jar>
     <javac
+     includeantruntime="true"
      encoding="${build.encoding}"
      srcdir="${test.src.dir}/testshell"
      includes="*.java"
@@ -728,6 +862,7 @@
     <mkdir dir="${test.debug.data}"/>
     <copy file="${test.src.dir}/org/apache/hadoop/mapred/testscript.txt" todir="${test.debug.data}"/>
     <copy file="${test.src.dir}/org/apache/hadoop/mapred/test.txt" todir="${test.cache.data}"/>
+    <copy file="${test.src.dir}/org/apache/hadoop/io/compress/snappy/testsnappy.txt" todir="${test.cache.data}"/>
     <copy file="${test.src.dir}/org/apache/hadoop/mapred/test.jar" todir="${test.cache.data}"/>
     <copy file="${test.src.dir}/org/apache/hadoop/mapred/test.zip" todir="${test.cache.data}"/>
     <copy file="${test.src.dir}/org/apache/hadoop/mapred/test.tar" todir="${test.cache.data}"/>
@@ -807,7 +942,7 @@
       <sysproperty key="test.build.extraconf" value="${test.build.extraconf}" />
       <sysproperty key="hadoop.policy.file" value="hadoop-policy.xml"/>
       <sysproperty key="java.library.path"
-       value="${build.native}/lib:${lib.dir}/native/${build.platform}"/>
+        value="${build.native}/lib:${lib.dir}/native/${build.platform}:${snappy.lib}:${configerator.lib}:${cgroup.lib}:{userGroupInfo.lib}"/>
       <sysproperty key="install.c++.examples" value="${install.c++.examples}"/>
       <sysproperty key="user.home" value="${test.user.home}"/>
       <env key="LD_LIBRARY_PATH" value="${build.native}/lib${path.separator}${env.LD_LIBRARY_PATH}"/>
@@ -1059,6 +1194,9 @@
         <packageset dir="${core.src.dir}"/>
         <packageset dir="${mapred.src.dir}"/>
     	<packageset dir="${examples.dir}"/>
+    	<packageset dir="${hdfs.src.dir}"/>
+    	<packageset dir="src/contrib/highavailability/src/java"/>
+    	<packageset dir="src/contrib/raid/src/java"/>
 
     	<packageset dir="src/contrib/streaming/src/java"/>
     	<packageset dir="src/contrib/data_join/src/java"/>
@@ -1085,6 +1223,9 @@
        <group title="contrib: Index" packages="org.apache.hadoop.contrib.index*"/>
        <group title="contrib: FailMon" packages="org.apache.hadoop.contrib.failmon*"/>
     </javadoc>
+    <jar jarfile="${build.dir}/${final.name}-javadoc.jar">
+      <fileset dir="${build.javadoc}" includes="**/*"/>
+    </jar>
   </target>
 
   <target name="api-xml" depends="ivy-retrieve-jdiff,javadoc,write-null">
@@ -1173,6 +1314,8 @@
 	  <env key="BASE_NATIVE_LIB_DIR" value="${lib.dir}/native"/>
 	  <env key="BUILD_NATIVE_DIR" value="${build.dir}/native"/>
 	  <env key="DIST_LIB_DIR" value="${dist.dir}/lib/native"/>
+    <env key="BUNDLE_SNAPPY_LIB" value="${bundle.snappy}"/>
+    <env key="SNAPPY_LIB_DIR" value="${snappy.prefix}/lib"/>
 	  <arg line="${native.src.dir}/packageNativeHadoop.sh"/>
     </exec>
 
@@ -1226,6 +1369,7 @@
 
     <copy todir="${dist.dir}/" file="build.xml"/>
 
+    <chmod perm="ugo+x" file="${dist.dir}/src/native/configure"/>
     <chmod perm="ugo+x" type="file" parallel="false">
         <fileset dir="${dist.dir}/bin"/>
         <fileset dir="${dist.dir}/src/contrib/">
@@ -1250,6 +1394,7 @@
           <exclude name="${final.name}/contrib/*/bin/*" />
           <exclude name="${final.name}/src/contrib/ec2/bin/*" />
           <exclude name="${final.name}/src/contrib/ec2/bin/image/*" />
+          <exclude name="${final.name}/src/native/configure" />
           <include name="${final.name}/**" />
         </tarfileset>
         <tarfileset dir="${build.dir}" mode="755">
@@ -1257,10 +1402,24 @@
           <include name="${final.name}/contrib/*/bin/*" />
           <include name="${final.name}/src/contrib/ec2/bin/*" />
           <include name="${final.name}/src/contrib/ec2/bin/image/*" />
+          <include name="${final.name}/src/native/configure" />
         </tarfileset>
       </param.listofitems>
     </macro_tar>
   </target>
+
+  <target name="superjar" depends="bin-package">        
+    <jar jarfile="${build.dir}/${final.name}-super.jar">        
+        <zipgroupfileset dir="lib" includes="*jar"/>    
+        <zipgroupfileset dir="build" includes="*jar"/>  
+        <zipgroupfileset dir="build/contrib/corona" includes="*jar"/>   
+        <zipgroupfileset dir="build/contrib/highavailability" includes="*jar"/>   
+        <zipgroupfileset dir="build/contrib/raid" includes="*jar"/>   
+        <zipgroupfileset dir="build/contrib/corona/lib" includes="*jar"/>       
+        <zipgroupfileset dir="build/ivy/lib/Hadoop/common/" includes="*jar"/>   
+        <zipgroupfileset dir="build/ivy/lib/corona/common/" includes="*jar"/>   
+    </jar>      
+  </target>     
 
   <target name="bin-package" depends="compile, jar, examples, tools-jar, jar-test, ant-tasks, package-librecordio"
 		description="assembles artifacts for binary target">
@@ -1283,7 +1442,10 @@
 	  <env key="BASE_NATIVE_LIB_DIR" value="${lib.dir}/native"/>
 	  <env key="BUILD_NATIVE_DIR" value="${build.dir}/native"/>
 	  <env key="DIST_LIB_DIR" value="${dist.dir}/lib/native"/>
+    <env key="BUNDLE_SNAPPY_LIB" value="${bundle.snappy}"/>
+    <env key="SNAPPY_LIB_DIR" value="${snappy.prefix}/lib"/>
 	  <arg line="${native.src.dir}/packageNativeHadoop.sh"/>
+    <env key="CGROUP_LIB_DIR" value="${cgroup.prefix}/lib"/>
     </exec>
 
     <subant target="package">
@@ -1334,6 +1496,11 @@
   </target>
 
   <target name="binary" depends="bin-package" description="Make tarball without source and documentation">
+    <copy todir="${build.dir}/${final.name}" includeEmptyDirs="false">
+      <fileset dir="${build.dir}/ivy/maven/">
+        <include name="generated.pom"/>
+      </fileset>
+    </copy>
     <macro_tar param.destfile="${build.dir}/${final.name}-bin.tar.gz">
       <param.listofitems>
         <tarfileset dir="${build.dir}" mode="664">
@@ -1344,6 +1511,7 @@
         </tarfileset>
         <tarfileset dir="${build.dir}" mode="755">
           <include name="${final.name}/bin/*" />
+          <include name="${final.name}/generated.pom"/>
         </tarfileset>
       </param.listofitems>
     </macro_tar>
@@ -1584,6 +1752,7 @@
 
   <target name="compile-ant-tasks" depends="compile-core">
     <javac
+        includeantruntime="true"
         encoding="${build.encoding}"
         srcdir="${anttasks.dir}"
         includes="org/apache/hadoop/ant/**/*.java"
@@ -1866,7 +2035,7 @@
     <ivy:publish
       settingsRef="${ant.project.name}.ivy.settings"
       resolver="local"
-      pubrevision="${hadoop.version}"
+      pubrevision="${version}"
       overwrite="true"
       artifactspattern="${build.dir}/${ivy.publish.pattern}" />
   </target>
@@ -1961,5 +2130,9 @@
     </exec>
   </target>
   <!-- end of task-controller target -->
+
+  <target name="print-version">
+    <echo message="${version}" />
+  </target>
 </project>
 

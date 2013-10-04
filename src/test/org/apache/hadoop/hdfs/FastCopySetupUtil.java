@@ -22,7 +22,9 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -49,6 +51,9 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.HardLink;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.tools.FastCopy.FastCopyFileStatus;
+import org.apache.hadoop.hdfs.util.InjectionEvent;
+import org.apache.hadoop.util.InjectionEventI;
+import org.apache.hadoop.util.InjectionHandler;
 
 import org.junit.AfterClass;
 
@@ -88,9 +93,6 @@ public class FastCopySetupUtil {
     // timeout the unit test catches it.
     setConf("dfs.replication.pending.timeout.sec", 60);
 
-    // Set a high block finish threshold so that unit test completes quickly.
-    setConf("dfs.fastcopy.block.finish.threshold", 20);
-
     // Make sure we get multiple blocks.
     setConf("dfs.block.size", BLOCK_SIZE);
     setConf("io.bytes.per.checksum", BYTES_PER_CHECKSUM);
@@ -100,10 +102,8 @@ public class FastCopySetupUtil {
     setConf(FSConstants.DFS_SOFT_LEASE_KEY, softLeasePeriod);
 
     System.setProperty("test.build.data", "build/test/data1");
-    cluster = new MiniDFSCluster(conf, 6, true, new String[] { "/r1", "/r2",
-        "/r1", "/r2", "/r1", "/r2" }, new String[] { "h1", "h2", "h3", "h1",
-        "h2", "h3" });
-
+    cluster = new MiniDFSCluster(conf, 6, new String[] { "/r1", "/r2",
+        "/r1", "/r2", "/r1", "/r2" }, null, true, true);
     for (DataNode dn : cluster.getDataNodes()) {
       dnMap.put(dn.getSelfAddr().getPort(), dn);
     }
@@ -114,10 +114,8 @@ public class FastCopySetupUtil {
     fs = (DistributedFileSystem) cluster.getFileSystem();
 
     System.setProperty("test.build.data", "build/test/data2");
-    remoteCluster = new MiniDFSCluster(remoteConf, 6, true, new String[] {
-        "/r1", "/r2", "/r1", "/r2", "/r1", "/r2" }, new String[] { "h1", "h2",
-        "h3", "h1", "h2", "h3" });
-
+    remoteCluster = new MiniDFSCluster(remoteConf, 6, new String[] { "/r1", "/r2", "/r1", "/r2",
+        "/r1", "/r2" }, null, true, true);
     for (DataNode dn : remoteCluster.getDataNodes()) {
       dnMap.put(dn.getSelfAddr().getPort(), dn);
     }
@@ -154,8 +152,7 @@ public class FastCopySetupUtil {
         try {
           // Make sure we have no pendingReplicationBlocks
           pass = (0 == cluster.getNameNode().namesystem
-              .getPendingReplicationBlocks());
-          pass = (0 == remoteCluster.getNameNode().namesystem
+              .getPendingReplicationBlocks()) && (0 == remoteCluster.getNameNode().namesystem
               .getPendingReplicationBlocks());
           create_verify_file();
           try {
@@ -227,6 +224,29 @@ public class FastCopySetupUtil {
     NameNode namenode = cluster.getNameNode();
     try {
       for (int i = 0; i < COPIES; i++) {
+        fastCopy.copy(src, destination + i, fs, fs);
+        assertTrue(verifyCopiedFile(src, destination + i, namenode, namenode,
+            fs, fs, hardlink));
+        verifyFileStatus(destination + i, namenode, fastCopy);
+      }
+    } catch (Exception e) {
+      LOG.error("Fast Copy failed with exception : ", e);
+      fail("Fast Copy failed");
+    } finally {
+      fastCopy.shutdown();
+    }
+    assertTrue(pass);
+  }
+
+  public void testFastCopyOldAPI(boolean hardlink) throws Exception {
+    // Create a source file.
+    String src = "/testFastCopySrc" + hardlink;
+    generateRandomFile(fs, src, FILESIZE);
+    String destination = "/testFastCopyDestination" + hardlink;
+    FastCopy fastCopy = new FastCopy(conf, fs, fs);
+    NameNode namenode = cluster.getNameNode();
+    try {
+      for (int i = 0; i < COPIES; i++) {
         fastCopy.copy(src, destination + i);
         assertTrue(verifyCopiedFile(src, destination + i, namenode, namenode,
             fs, fs, hardlink));
@@ -249,7 +269,7 @@ public class FastCopySetupUtil {
     FastCopy fastCopy = new FastCopy(conf);
     List<FastFileCopyRequest> requests = new ArrayList<FastFileCopyRequest>();
     for (int i = 0; i < COPIES; i++) {
-      requests.add(new FastFileCopyRequest(src, destination + i));
+      requests.add(new FastFileCopyRequest(src, destination + i, fs, fs));
     }
     NameNode namenode = cluster.getNameNode();
     try {
@@ -268,6 +288,7 @@ public class FastCopySetupUtil {
     assertTrue(pass);
   }
 
+
   private void verifyFileStatus(String file, NameNode namenode,
       FastCopy fastCopy) throws Exception {
     LOG.info("Verifying for file : " + file);
@@ -282,15 +303,16 @@ public class FastCopySetupUtil {
 
   public void testInterFileSystemFastCopy(boolean hardlink) throws Exception {
     // Create a source file.
+    setInjectionHandler();
     String src = "/testInterFileSystemFastCopySrc" + hardlink;
     generateRandomFile(fs, src, FILESIZE);
     String destination = "/testInterFileSystemFastCopyDst" + hardlink;
-    FastCopy fastCopy = new FastCopy(conf, fs, remoteFs);
+    FastCopy fastCopy = new FastCopy(conf);
     NameNode srcNameNode = cluster.getNameNode();
     NameNode dstNameNode = remoteCluster.getNameNode();
     try {
       for (int i = 0; i < COPIES; i++) {
-        fastCopy.copy(src, destination + i);
+        fastCopy.copy(src, destination + i, fs, remoteFs);
         assertTrue(verifyCopiedFile(src, destination + i, srcNameNode,
             dstNameNode, fs, remoteFs, hardlink));
         verifyFileStatus(destination + i, dstNameNode, fastCopy);
@@ -304,17 +326,38 @@ public class FastCopySetupUtil {
     assertTrue(pass);
   }
 
+  private static void setInjectionHandler() {
+    InjectionHandler.set(new InjectionHandler() {
+      protected boolean _trueCondition(InjectionEventI event, Object... args) {
+        if (event == InjectionEvent.FSNAMESYSTEM_SKIP_LOCAL_DN_LOOKUP) {
+          if (args == null) {
+            return true;
+          }
+          if (args.length == 1) {
+            if (args[0] == null || !(args[0] instanceof String)) {
+              return true;
+            }
+            String datanodeIpAddress = (String) args[0];
+            return !("127.0.0.1".equals(datanodeIpAddress));
+          }
+          return true;
+        }
+        return true;
+      }
+    });
+  }
+
   public void testInterFileSystemFastCopyMultiple(boolean hardlink)
       throws Exception {
     // Create a source file.
-    String src = "/testInterFileSystemFastCopyMultipleSrc" + hardlink;
+    String src = "/testInterFileSystemFastCopy MultipleSrc" + hardlink;
     generateRandomFile(fs, src, FILESIZE);
-    String destination = "/testInterFileSystemFastCopyMultipleDestination"
+    String destination = "/testInterFileSystemFastCopy MultipleDestination"
         + hardlink;
-    FastCopy fastCopy = new FastCopy(conf, fs, remoteFs);
+    FastCopy fastCopy = new FastCopy(conf);
     List<FastFileCopyRequest> requests = new ArrayList<FastFileCopyRequest>();
     for (int i = 0; i < COPIES; i++) {
-      requests.add(new FastFileCopyRequest(src, destination + i));
+      requests.add(new FastFileCopyRequest(src, destination + i, fs, remoteFs));
     }
     NameNode srcNameNode = cluster.getNameNode();
     NameNode dstNameNode = remoteCluster.getNameNode();
@@ -342,13 +385,13 @@ public class FastCopySetupUtil {
     int i;
     for (i = 0; i < COPIES; i++) {
       generateRandomFile(fs, src + i, TMPFILESIZE); // Create a file
-      argsList.add(src + i);
+      argsList.add(fs.makeQualified(new Path(src + i)).toString());
     }
     String destination = "/testFastCopyShellMultipleDestination" + hardlink;
     fs.mkdirs(new Path(destination));
     NameNode namenode = cluster.getNameNode();
 
-    argsList.add(destination);
+    argsList.add(fs.makeQualified(new Path(destination)).toString());
     argsList.addAll(Arrays.asList(extraargs));
     String args[] = new String[argsList.size()];
     args = argsList.toArray(args);
@@ -429,14 +472,10 @@ public class FastCopySetupUtil {
     assertTrue(pass);
   }
 
-  public boolean verifyCopiedFile(String src, String destination,
-      NameNode srcNameNode, NameNode dstNameNode, FileSystem srcFs,
-      FileSystem dstFs, boolean hardlink) throws Exception {
-
-    verifyBlockLocations(src, destination, srcNameNode, dstNameNode, hardlink);
-
+  public static boolean compareFiles(String src, FileSystem srcFs, String dst,
+      FileSystem dstFs) throws Exception {
     Path srcFilePath = new Path(src);
-    Path destFilePath = new Path(destination);
+    Path destFilePath = new Path(dst);
     FSDataInputStream srcStream = srcFs.open(srcFilePath, 4096);
     FSDataInputStream destStream = dstFs.open(destFilePath, 4096);
     int counter = 0;
@@ -468,6 +507,15 @@ public class FastCopySetupUtil {
     }
   }
 
+  public boolean verifyCopiedFile(String src, String destination,
+      NameNode srcNameNode, NameNode dstNameNode, FileSystem srcFs,
+      FileSystem dstFs, boolean hardlink) throws Exception {
+
+    verifyBlockLocations(src, destination, srcNameNode, dstNameNode, hardlink);
+
+    return compareFiles(src, srcFs, destination, dstFs);
+  }
+
   public boolean verifyBlockLocations(String src, String destination,
       NameNode srcNameNode, NameNode dstNameNode, boolean hardlink)
       throws IOException {
@@ -487,17 +535,17 @@ public class FastCopySetupUtil {
       LocatedBlock dstBlock = dstIt.next();
       List<DatanodeInfo> srcLocations = Arrays.asList(srcBlock.getLocations());
       List<DatanodeInfo> dstLocations = Arrays.asList(dstBlock.getLocations());
-
+      
       System.out.println("Locations for src block : " + srcBlock.getBlock()
           + " file : " + src);
       for (DatanodeInfo info : srcLocations) {
-        System.out.println("Datanode : " + info.toString());
+        System.out.println("Datanode : " + info.toString() + " rack: " + info.getNetworkLocation());
       }
 
       System.out.println("Locations for dst block : " + dstBlock.getBlock()
           + " file : " + destination);
       for (DatanodeInfo info : dstLocations) {
-        System.out.println("Datanode : " + info.toString());
+        System.out.println("Datanode : " + info.toString() + " rack: " + info.getNetworkLocation());
       }
 
       assertEquals(srcLocations.size(), dstLocations.size());
@@ -508,26 +556,23 @@ public class FastCopySetupUtil {
         assertTrue(srcLocations.containsAll(dstLocations));
         assertTrue(dstLocations.containsAll(srcLocations));
       } else {
-        // Verify blocks are rack local.
+        // Since all datanodes are on the same host in a unit test, the inter
+        // filesystem copy can have blocks end up on any datanode.
         Iterator<DatanodeInfo> sit = srcLocations.iterator();
         while (sit.hasNext()) {
           DatanodeInfo srcInfo = sit.next();
 
           // Verify location.
           Iterator<DatanodeInfo> dit = dstLocations.iterator();
-          boolean flag = false;
-          while (dit.hasNext() && !flag) {
+          while (dit.hasNext()) {
             DatanodeInfo dstInfo = dit.next();
-            if (dstInfo.getHostName().equals(srcInfo.getHostName())) {
+            if (dstInfo.getHost().equals(srcInfo.getHost())) {
               verifyHardLinks(srcInfo, dstInfo,
                   srcLocatedBlocks.getNamespaceID(), srcBlock.getBlock(),
                   dstLocatedBlocks.getNamespaceID(), dstBlock.getBlock(),
                   hardlink);
             }
-            flag = srcInfo.getNetworkLocation().equals(
-                dstInfo.getNetworkLocation());
           }
-          assertTrue(flag);
         }
       }
     }

@@ -31,7 +31,6 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.examples.SleepJob;
-import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.mapred.CoronaJobTracker;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapreduce.Job;
@@ -44,11 +43,23 @@ import org.apache.hadoop.util.ToolRunner;
 public class TestMiniCoronaRunJob extends TestCase {
   private static final Log LOG =
       LogFactory.getLog(TestMiniCoronaRunJob.class);
-  private static String TEST_ROOT_DIR = new Path(System.getProperty(
-		    "test.build.data", "/tmp")).toString().replace(' ', '+');
   private MiniCoronaCluster corona = null;
-  
+
+  public void testEmptyJob() throws Exception {
+    LOG.info("Starting testEmptyJob");
+    corona = new MiniCoronaCluster.Builder().numTaskTrackers(1).build();
+    JobConf conf = corona.createJobConf();
+    long start = System.currentTimeMillis();
+    String[] args = {"-m", "0", "-r", "0", "-mt", "1", "-rt", "1", "-nosetup" };
+    ToolRunner.run(conf, new SleepJob(), args);
+    // This sleep is here to wait for the JobTracker to go down completely
+    TstUtils.reliableSleep(1000);
+    long end = System.currentTimeMillis();
+    LOG.info("Time spent for testEmptyJob:" + (end - start));
+  }
+
   public void testOneTaskWithOneTaskTracker() throws Exception {
+    LOG.info("Starting testOneTaskWithOneTaskTracker");
     corona = new MiniCoronaCluster.Builder().numTaskTrackers(1).build();
     JobConf conf = corona.createJobConf();
     long start = System.currentTimeMillis();
@@ -61,6 +72,7 @@ public class TestMiniCoronaRunJob extends TestCase {
   }
 
   public void testOneTaskWithMultipleTaskTracker() throws Exception {
+    LOG.info("Starting testOneTaskWithMultipleTaskTracker");
     corona = new MiniCoronaCluster.Builder().numTaskTrackers(4).build();
     JobConf conf = corona.createJobConf();
     long start = System.currentTimeMillis();
@@ -73,6 +85,7 @@ public class TestMiniCoronaRunJob extends TestCase {
   }
 
   public void testManyTasksWithManyTaskTracker() throws Exception {
+    LOG.info("Starting testManyTasksWithManyTaskTracker");
     corona = new MiniCoronaCluster.Builder().numTaskTrackers(4).build();
     JobConf conf = corona.createJobConf();
     long start = System.currentTimeMillis();
@@ -85,6 +98,7 @@ public class TestMiniCoronaRunJob extends TestCase {
   }
 
   public void testMultipleJobClients() throws Exception {
+    LOG.info("Starting testMultipleJobClients");
     corona = new MiniCoronaCluster.Builder().numTaskTrackers(4).build();
     JobConf conf = corona.createJobConf();
     long start = System.currentTimeMillis();
@@ -97,6 +111,7 @@ public class TestMiniCoronaRunJob extends TestCase {
   }
 
   public void testMemoryLimit() throws Exception {
+    LOG.info("Starting testMemoryLimit");
     JobConf conf = new JobConf();
     conf.setInt(CoronaConf.NODE_RESERVED_MEMORY_MB, Integer.MAX_VALUE);
     corona = new MiniCoronaCluster.Builder().conf(conf).numTaskTrackers(2).build();
@@ -104,9 +119,11 @@ public class TestMiniCoronaRunJob extends TestCase {
     long start = System.currentTimeMillis();
     FutureTask<Boolean> task = submitSleepJobFutureTask(jobConf);
     checkTaskNotDone(task, 10);
-    corona.getClusterManager().getNodeManager().setNodeReservedMemoryMB(0);
+    NodeManager nm =  corona.getClusterManager().getNodeManager();
+    nm.getResourceLimit().setNodeReservedMemoryMB(0);
     Assert.assertTrue(task.get());
     long end = System.currentTimeMillis();
+    LOG.info("Task Done. Verifying");
     new ClusterManagerMetricsVerifier(corona.getClusterManager(),
         1, 1, 1, 1, 1, 1, 0, 0).verifyAll();
     LOG.info("Time spent for testMemoryLimit:" +
@@ -114,6 +131,7 @@ public class TestMiniCoronaRunJob extends TestCase {
   }
 
   public void testDiskLimit() throws Exception {
+    LOG.info("Starting testDiskLimit");
     JobConf conf = new JobConf();
     conf.setInt(CoronaConf.NODE_RESERVED_DISK_GB, Integer.MAX_VALUE);
     corona = new MiniCoronaCluster.Builder().conf(conf).numTaskTrackers(2).build();
@@ -121,12 +139,13 @@ public class TestMiniCoronaRunJob extends TestCase {
     long start = System.currentTimeMillis();
     FutureTask<Boolean> task = submitSleepJobFutureTask(jobConf);
     checkTaskNotDone(task, 10);
-    corona.getClusterManager().getNodeManager().setNodeReservedDiskGB(0);
+    NodeManager nm =  corona.getClusterManager().getNodeManager();
+    nm.getResourceLimit().setNodeReservedDiskGB(0);
     Assert.assertTrue(task.get());
     long end = System.currentTimeMillis();
     new ClusterManagerMetricsVerifier(corona.getClusterManager(),
         1, 1, 1, 1, 1, 1, 0, 0).verifyAll();
-    LOG.info("Time spent for testMemoryLimit:" +
+    LOG.info("Time spent for testDiskLimit:" +
         (end - start));
   }
 
@@ -159,6 +178,7 @@ public class TestMiniCoronaRunJob extends TestCase {
   }
 
   public void testLocality() throws Exception {
+    LOG.info("Starting testOneTaskWithOneTaskTracker");
     String[] racks = "/rack-1,/rack-1,/rack-2,/rack-3".split(",");
     String[] trackers = "tracker-1,tracker-2,tracker-3,tracker-4".split(",");
     String locationsCsv = "tracker-1,tracker-1,tracker-3,tracker-3";
@@ -202,6 +222,8 @@ public class TestMiniCoronaRunJob extends TestCase {
                      "-mt", "1",
                      "-rt", "1" };
     ToolRunner.run(conf, new SleepJob(), args);
+    // This sleep is here to wait for the JobTracker to go down completely
+    TstUtils.reliableSleep(1000);
   }
 
   private void runMultipleSleepJobs(final JobConf conf,
@@ -237,5 +259,4 @@ public class TestMiniCoronaRunJob extends TestCase {
       fail("Some of the Sleepjobs failed");
     }
   }
-
 }

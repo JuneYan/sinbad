@@ -20,6 +20,7 @@ package org.apache.hadoop.ipc;
 
 import org.apache.commons.logging.*;
 
+import org.apache.hadoop.hdfs.DFSTestUtil;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.util.StringUtils;
@@ -34,9 +35,14 @@ import java.net.SocketTimeoutException;
 import junit.framework.TestCase;
 
 import org.apache.hadoop.conf.Configuration;
+import org.junit.Ignore;
+import org.junit.Test;
+import static org.junit.Assert.*;
+
+
 
 /** Unit tests for IPC. */
-public class TestIPC extends TestCase {
+public class TestIPC {
   public static final Log LOG =
     LogFactory.getLog(TestIPC.class);
   
@@ -46,8 +52,10 @@ public class TestIPC extends TestCase {
   
   static {
     Client.setPingInterval(conf, PING_INTERVAL);
+    conf.setInt(Server.IPC_SERVER_RPC_READ_THREADS_KEY, 3);
+    conf.setInt(Server.IPC_SERVER_CLIENT_IDLETHRESHOLD, 0);
+    conf.setInt(Server.IPC_SERVER_CLIENT_CONN_MAXIDLETIME, 150);
   }
-  public TestIPC(String name) { super(name); }
 
   private static final Random RANDOM = new Random();
 
@@ -56,8 +64,7 @@ public class TestIPC extends TestCase {
   private static class TestServer extends Server {
     private boolean sleep;
 
-    public TestServer(int handlerCount, boolean sleep) 
-      throws IOException {
+    public TestServer(int handlerCount, boolean sleep) throws IOException {
       super(ADDRESS, 0, LongWritable.class, handlerCount, conf);
       this.sleep = sleep;
     }
@@ -69,9 +76,10 @@ public class TestIPC extends TestCase {
         // sleep a bit
         try {
           Thread.sleep(RANDOM.nextInt(PING_INTERVAL) + MIN_SLEEP_TIME);
-        } catch (InterruptedException e) {}
+        } catch (InterruptedException e) {
+        }
       }
-      return param;                               // echo param as result
+      return param; // echo param as result
     }
   }
 
@@ -79,28 +87,45 @@ public class TestIPC extends TestCase {
     private Client client;
     private InetSocketAddress server;
     private int count;
+    private int repeatCount;
     private boolean failed;
+    // We use socketTime as a hacky way to get separate sockets to the same address
+    private int lowSocketTimeout;
+    private int highSocketTimeout;
 
-    public SerialCaller(Client client, InetSocketAddress server, int count) {
+    public SerialCaller(Client client, InetSocketAddress server, int count, int repeatCount,
+        int lowSocketTimeout, int highSocketTimeout) {
       this.client = client;
       this.server = server;
       this.count = count;
+      this.repeatCount = repeatCount;
+      this.lowSocketTimeout = lowSocketTimeout;
+      this.highSocketTimeout = highSocketTimeout;
     }
 
     public void run() {
       for (int i = 0; i < count; i++) {
-        try {
-          LongWritable param = new LongWritable(RANDOM.nextLong());
-          LongWritable value =
-            (LongWritable)client.call(param, server, null, null, 0);
-          if (!param.equals(value)) {
-            LOG.fatal("Call failed!");
+        int socketTimeout;
+        if (lowSocketTimeout == highSocketTimeout) {
+          socketTimeout = lowSocketTimeout;
+        } else {
+          socketTimeout = lowSocketTimeout
+              + RANDOM.nextInt(highSocketTimeout - lowSocketTimeout);
+        }
+        for (int j = 0; j < repeatCount; j++) {
+          try {
+            LongWritable param = new LongWritable(RANDOM.nextLong());
+            LongWritable value = (LongWritable) client.call(param, server,
+                null, null, socketTimeout, false);
+            if (!param.equals(value)) {
+              LOG.fatal("Call failed!");
+              failed = true;
+              break;
+            }
+          } catch (Exception e) {
+            LOG.fatal("Caught: " + StringUtils.stringifyException(e));
             failed = true;
-            break;
           }
-        } catch (Exception e) {
-          LOG.fatal("Caught: " + StringUtils.stringifyException(e));
-          failed = true;
         }
       }
     }
@@ -141,14 +166,46 @@ public class TestIPC extends TestCase {
     }
   }
 
+  @Test
   public void testSerial() throws Exception {
-    testSerial(3, false, 2, 5, 100);
-    testSerial(3, true, 2, 5, 10);
+    testSerial(3, false, 2, 5, 100, 1, 0, 0);
+    testSerial(3, true, 2, 5, 10, 1, 0, 0);
   }
 
-  public void testSerial(int handlerCount, boolean handlerSleep, 
-                         int clientCount, int callerCount, int callCount)
-    throws Exception {
+  /**
+   * This is a simple benchmark which makes some traffic to both of IPC Server's
+   * listener and reader threads' so we can measure performance improvement of
+   * IPC's socket accept/read mechanism.
+   * 
+   * We create 32 clients all connecting to the same IPC server with 3 request
+   * reader threads. Every client sends 1024 requests using one connection and
+   * then moves on to a next one. In that way, both accept thread and reader
+   * threads get consistent loads.
+   * 
+   * The approach we use for a clients to move on to separate connections is by
+   * changing the socket timeout. Our IPC client will create a different
+   * connection if the socket timeout setting is different.
+   * 
+   * @throws Exception
+   */
+  @Ignore
+  @Test
+  public void testSerialBenchmark1() throws Exception {
+    conf.setInt("ipc.client.connection.maxidletime", 1);
+
+    long startTime = System.currentTimeMillis();
+    testSerial(32, false, 8, 32, 32, 1024, 60000, 60000 + 8);
+    long endTime = System.currentTimeMillis();
+    System.out.println("============== Benchmark Took: "
+        + (endTime - startTime) + " ms ===================");
+
+    conf.setInt("ipc.client.connection.maxidletime", 10000);
+
+  }
+
+  public void testSerial(int handlerCount, boolean handlerSleep,
+      int clientCount, int callerCount, int callCount, int repeatCount,
+      int lowSocketTimeout, int highSocketTimeout) throws Exception {
     Server server = new TestServer(handlerCount, handlerSleep);
     InetSocketAddress addr = NetUtils.getConnectAddress(server);
     server.start();
@@ -160,7 +217,8 @@ public class TestIPC extends TestCase {
     
     SerialCaller[] callers = new SerialCaller[callerCount];
     for (int i = 0; i < callerCount; i++) {
-      callers[i] = new SerialCaller(clients[i%clientCount], addr, callCount);
+      callers[i] = new SerialCaller(clients[i % clientCount], addr, callCount,
+          repeatCount, lowSocketTimeout, highSocketTimeout);
       callers[i].start();
     }
     for (int i = 0; i < callerCount; i++) {
@@ -172,7 +230,102 @@ public class TestIPC extends TestCase {
     }
     server.stop();
   }
-	
+  
+  private void waitNMilliSecond(long startTime, long timeout) {
+    long timeToSleep = timeout + startTime - System
+        .currentTimeMillis();
+    if (timeToSleep <= 0) {
+      return;
+    }
+    DFSTestUtil.waitNMilliSecond((int) timeToSleep);
+  }
+
+  @Test
+  public void testCleaningIdleConnections() throws Exception {
+    conf.setInt(Server.IPC_SERVER_RPC_READ_THREADS_KEY, 1);
+
+    Server server = new TestServer(2, false);
+    server.cleanupInterval = 10;
+    server.PURGE_INTERVAL = 100;
+    InetSocketAddress addr = NetUtils.getConnectAddress(server);
+    server.start();
+    
+    Configuration clientConf = new Configuration(conf);
+    // Make sure the server timeout triggers first.
+    clientConf.setInt(Server.IPC_SERVER_CLIENT_CONN_MAXIDLETIME, 10000);
+    
+    Client client1 = new Client(LongWritable.class, clientConf);
+    Client client2 = new Client(LongWritable.class, clientConf);
+
+    LongWritable param = new LongWritable(0);
+    client1.call(param, addr, null, null, 100000, false);
+    DFSTestUtil.waitNMilliSecond(150);
+    assertEquals(1, server.getNumOpenConnections());
+    client2.call(param, addr, null, null, 100000, false);
+    assertEquals(2, server.getNumOpenConnections());
+    DFSTestUtil.waitNMilliSecond(220);
+    assertEquals(1, server.getNumOpenConnections());
+    DFSTestUtil.waitNMilliSecond(150);
+    assertEquals(0, server.getNumOpenConnections());
+    
+    assertTrue(server.connectionSet.ifConnectionsClean());
+    
+    // Make sure remove happens in the same buckets by having many clients so
+    // there will sure be clients in the same buckets.
+    Client[] clients1 = new Client[5];
+    Client[] clients2 = new Client[5];
+    Client[] clients3 = new Client[5];
+    
+    for (int i = 0; i < 5; i++) {
+      clients1[i] = new Client(LongWritable.class, clientConf);
+      clients2[i] = new Client(LongWritable.class, clientConf);
+      clients3[i] = new Client(LongWritable.class, clientConf);
+    }
+
+    long startTime = System.currentTimeMillis();
+    for (int i = 0; i < 5; i++) {
+      clients1[i].call(param, addr, null, null, 100000, false);
+    }
+    assertEquals(5, server.getNumOpenConnections());
+    waitNMilliSecond(startTime, 90);
+    startTime = System.currentTimeMillis();
+    for (int i = 0; i < 5; i++) {
+      clients2[i].call(param, addr, null, null, 100000, false);
+    }
+    assertEquals(10, server.getNumOpenConnections());
+    waitNMilliSecond(startTime, 90);
+    startTime = System.currentTimeMillis();
+    for (int i = 0; i < 5; i++) {
+      clients3[i].call(param, addr, null, null, 100000, false);
+    }
+    assertEquals(15, server.getNumOpenConnections());
+    waitNMilliSecond(startTime, 90);
+    startTime = System.currentTimeMillis();
+    // Renew first batch of calls so that they don't expire
+    for (int i = 0; i < 5; i++) {
+      clients1[i].call(param, addr, null, null, 100000, false);
+    }
+    assertEquals(15, server.getNumOpenConnections());
+
+    waitNMilliSecond(startTime, 90);
+    startTime = System.currentTimeMillis();
+    assertEquals(15, server.getNumOpenConnections());
+    // renew the second batch of calls
+    for (int i = 0; i < 5; i++) {
+      clients2[i].call(param, addr, null, null, 100000, false);
+    }
+    // Wait for clients are cleared as expected.
+    DFSTestUtil.waitNMilliSecond(180);
+    assertEquals(10, server.getNumOpenConnections());
+    DFSTestUtil.waitNMilliSecond(200);
+    assertEquals(0, server.getNumOpenConnections());
+    
+    assertTrue(server.connectionSet.ifConnectionsClean());
+    
+    server.stop();
+  }
+  
+  @Test
   public void testParallel() throws Exception {
     testParallel(10, false, 2, 4, 2, 4, 100);
   }
@@ -215,13 +368,14 @@ public class TestIPC extends TestCase {
     }
   }
 	
+  @Test
   public void testStandAloneClient() throws Exception {
     testParallel(10, false, 2, 4, 2, 4, 100);
     Client client = new Client(LongWritable.class, conf);
     InetSocketAddress address = new InetSocketAddress("127.0.0.1", 10);
     try {
       client.call(new LongWritable(RANDOM.nextLong()),
-              address, null, null, 0);
+              address, null, null, 0, false);
       fail("Expected an exception to have been thrown");
     } catch (IOException e) {
       String message = e.getMessage();
@@ -252,6 +406,7 @@ public class TestIPC extends TestCase {
     }
   }
 
+  @Test
   public void testErrorClient() throws Exception {
     // start server
     Server server = new TestServer(1, false);
@@ -262,7 +417,7 @@ public class TestIPC extends TestCase {
     Client client = new Client(LongErrorWritable.class, conf);
     try {
       client.call(new LongErrorWritable(RANDOM.nextLong()),
-          addr, null, null, 0);
+          addr, null, null, 0, false);
       fail("Expected an exception to have been thrown");
     } catch (IOException e) {
       // check error
@@ -272,6 +427,7 @@ public class TestIPC extends TestCase {
     }
   }
 
+  @Test
   public void testIpcTimeout() throws Exception {
     // start server
     Server server = new TestServer(1, true);
@@ -283,22 +439,26 @@ public class TestIPC extends TestCase {
     // set timeout to be less than MIN_SLEEP_TIME
     try {
       client.call(new LongWritable(RANDOM.nextLong()),
-              addr, null, null, MIN_SLEEP_TIME/2);
+              addr, null, null, MIN_SLEEP_TIME/2, false);
       fail("Expected an exception to have been thrown");
     } catch (SocketTimeoutException e) {
       LOG.info("Get a SocketTimeoutException ", e);
     }
     // set timeout to be bigger than 3*ping interval
     client.call(new LongWritable(RANDOM.nextLong()),
-        addr, null, null, 3*PING_INTERVAL+MIN_SLEEP_TIME);
+        addr, null, null, 3*PING_INTERVAL+MIN_SLEEP_TIME, false);
   }
 
 	public static void main(String[] args) throws Exception {
 
     //new TestIPC("test").testSerial(5, false, 2, 10, 1000);
 
-    new TestIPC("test").testParallel(10, false, 2, 4, 2, 4, 1000);
-
+	  if (args.length >= 1 && args[0].equals("benchmark")) {
+	    System.out.println("args: " + args[0]);
+	    new TestIPC().testSerialBenchmark1();
+	  } else {
+	    new TestIPC().testParallel(10, false, 2, 4, 2, 4, 1000);
+	  }
   }
 
 }

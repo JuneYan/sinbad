@@ -315,7 +315,8 @@ public class NetworkTopology {
   } // end of InnerNode
     
   InnerNode clusterMap = new InnerNode(InnerNode.ROOT); // the root
-  private int numOfRacks = 0;  // rack counter
+  // we store list instead of a set, for in-order, by-index access
+  private final List<String> racks = new ArrayList<String>();
   private ReadWriteLock netlock;
   private Set<String> masterRacksSet = new HashSet<String>();
     
@@ -332,6 +333,18 @@ public class NetworkTopology {
       }
     }
 
+  }
+  
+  /**
+   * Get a copy of the racks list.
+   */
+  public List<String> getRacks() {
+    netlock.readLock().lock();
+    try {
+      return new ArrayList<String>(racks);
+    } finally {
+      netlock.readLock().unlock();
+    }
   }
     
   /** Add a leaf node
@@ -358,7 +371,13 @@ public class NetworkTopology {
       if (clusterMap.add(node)) {
         LOG.info("Adding a new node: "+NodeBase.getPath(node));
         if (rack == null) {
-          numOfRacks++;
+          String rackName = node.getNetworkLocation();
+          if (!racks.contains(rackName)) {
+            racks.add(rackName);
+          } else {
+            LOG.error("Discrepancy between network topology and list of racks. "
+                + "New rack was already in the list of racks: " + rackName);
+          }
         }
       }
       LOG.debug("NetworkTopology became:\n" + this.toString());
@@ -381,10 +400,16 @@ public class NetworkTopology {
     LOG.info("Removing a node: "+NodeBase.getPath(node));
     netlock.writeLock().lock();
     try {
+      String currentRackName = node.getNetworkLocation();
       if (clusterMap.remove(node)) {
         InnerNode rack = (InnerNode)getNode(node.getNetworkLocation());
         if (rack == null) {
-          numOfRacks--;
+          if (!racks.remove(currentRackName)) {
+            LOG.error("Discrepancy between network topology and list of racks. "
+                + "Removed rack "
+                + currentRackName
+                + " was not in the rack list.");
+          }
         }
       }
       LOG.debug("NetworkTopology became:\n" + this.toString());
@@ -456,7 +481,19 @@ public class NetworkTopology {
   public int getNumOfRacks() {
     netlock.readLock().lock();
     try {
-      return numOfRacks;
+      return racks.size();
+    } finally {
+      netlock.readLock().unlock();
+    }
+  }
+ 
+  /** Returns the set of racks */
+  public Set<String> getAllRacks() {
+    netlock.readLock().lock();
+    try {
+      Set<String> result = new HashSet<String>(this.racks);
+      result.addAll(this.masterRacksSet);
+      return result;
     } finally {
       netlock.readLock().unlock();
     }
@@ -558,8 +595,47 @@ public class NetworkTopology {
       netlock.readLock().unlock();
     }
   }
-    
-  private Node chooseRandom(String scope, String excludedScope){
+  
+  /**
+   * Choose a rack which is not in exlcudedRacks
+   * @param excludedRacks excluded racks
+   * @return a rack
+   */
+  public String chooseRack(Set<String> excludedRacks) {
+    String chosenRack = null;
+    HashSet<Integer> chosenIndexes = new HashSet<Integer>();
+
+    netlock.readLock().lock();
+    try {
+      int totalRacks = getNumOfRacks();
+      if (totalRacks - excludedRacks.size() <= 0)
+        return null; // all racks are excluded
+
+      while (true) {
+        int rackIndex;
+        do {
+          rackIndex = r.nextInt(totalRacks);
+        } while (chosenIndexes.contains(rackIndex));
+        
+        chosenIndexes.add(rackIndex);
+        chosenRack = racks.get(rackIndex);
+        
+        // if no excluded nodes are specified or the chosen node is not excluded
+        // return it
+        if (excludedRacks == null || (!excludedRacks.contains(chosenRack))) {
+          return chosenRack;
+        }
+        // for sanity check if we used all indexes
+        if (chosenIndexes.size() == totalRacks) {
+          return null;
+        }
+      }
+    } finally {
+      netlock.readLock().unlock();
+    }
+  }
+  
+  public Node chooseRandom(String scope, String excludedScope){
     if (excludedScope != null) {
       if (scope.startsWith(excludedScope)) {
         return null;
@@ -688,7 +764,7 @@ public class NetworkTopology {
     // print the number of racks
     StringBuffer tree = new StringBuffer();
     tree.append("Number of racks: ");
-    tree.append(numOfRacks);
+    tree.append(racks.size());
     tree.append("\n");
     // print the number of leaves
     int numOfLeaves = getNumOfLeaves();
@@ -781,6 +857,48 @@ public class NetworkTopology {
         end--;
         start++;
       }
+    }
+  }
+
+  /**
+   * Form a pipeline of nodes by finding a shortest path that starts from the
+   * writer and traverses all <i>nodes</i>. This is basically a traveling
+   * salesman problem. The array of nodes will be modified in-place.
+   * @param writer the node starting the pipeline
+   * @param nodes the nodes to be traversed, modified in-place
+   */
+  public void getPipeline(Node writer, Node[] nodes) {
+    if (nodes.length == 0) {
+      return;
+    }
+
+    netlock.readLock().lock();
+    try {
+      if (writer == null || !contains(writer)) {
+        writer = nodes[0];
+      }
+      for (int index = 0; index < nodes.length; index++) {
+        Node shortestNode = nodes[index];
+        int shortestDistance = getDistance(writer, shortestNode);
+        int shortestIndex = index;
+        for (int i = index + 1; i < nodes.length; i++) {
+          Node currentNode = nodes[i];
+          int currentDistance = getDistance(writer, currentNode);
+          if (shortestDistance > currentDistance) {
+            shortestDistance = currentDistance;
+            shortestNode = currentNode;
+            shortestIndex = i;
+          }
+        }
+        //switch position index & shortestIndex
+        if (index != shortestIndex) {
+          nodes[shortestIndex] = nodes[index];
+          nodes[index] = shortestNode;
+        }
+        writer = shortestNode;
+      }
+    } finally {
+      netlock.readLock().unlock();
     }
   }
 }

@@ -25,9 +25,11 @@ import java.net.URL;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 
 import javax.servlet.Filter;
 import javax.servlet.FilterChain;
@@ -43,14 +45,20 @@ import javax.servlet.http.HttpServletResponse;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.jmx.JMXJsonServlet;
 import org.apache.hadoop.log.LogLevel;
 import org.apache.hadoop.metrics.MetricsServlet;
 import org.apache.hadoop.util.ReflectionUtils;
+import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.conf.ConfServlet;
 
+import org.mortbay.io.Buffer;
 import org.mortbay.jetty.Connector;
 import org.mortbay.jetty.Handler;
+import org.mortbay.jetty.MimeTypes;
 import org.mortbay.jetty.Server;
+import org.mortbay.jetty.bio.SocketConnector;
+import org.mortbay.jetty.handler.ContextHandler;
 import org.mortbay.jetty.handler.ContextHandlerCollection;
 import org.mortbay.jetty.nio.SelectChannelConnector;
 import org.mortbay.jetty.security.SslSocketConnector;
@@ -60,6 +68,7 @@ import org.mortbay.jetty.servlet.FilterHolder;
 import org.mortbay.jetty.servlet.FilterMapping;
 import org.mortbay.jetty.servlet.ServletHandler;
 import org.mortbay.jetty.servlet.ServletHolder;
+import org.mortbay.jetty.servlet.ServletMapping;
 import org.mortbay.jetty.webapp.WebAppContext;
 import org.mortbay.thread.QueuedThreadPool;
 import org.mortbay.util.MultiException;
@@ -91,6 +100,7 @@ public class HttpServer implements FilterContainer {
   protected final List<String> filterNames = new ArrayList<String>();
   private static final int MAX_RETRIES = 10;
   static final String HTTP_MAX_THREADS = "hadoop.http.max.threads";
+  public static final String HTTP_THREADPOOL_MAX_STOP_TIME = "hadoop.http.threadpool.max.stoptime";
 
   /** Same as this(name, bindAddress, port, findPort, null); */
   public HttpServer(String name, String bindAddress, int port, boolean findPort
@@ -118,10 +128,14 @@ public class HttpServer implements FilterContainer {
     webServer.addConnector(listener);
 
     int maxThreads = conf.getInt(HTTP_MAX_THREADS, -1);
+    // Set the timeout for the threadpool to exit (default 1 second)
+    int maxStopTime = conf.getInt(HTTP_THREADPOOL_MAX_STOP_TIME, 1000);
     // If HTTP_MAX_THREADS is not configured, QueueThreadPool() will use the 
     // default value (currently 254).
     QueuedThreadPool threadPool = maxThreads == -1 ?
         new QueuedThreadPool() : new QueuedThreadPool(maxThreads);
+    threadPool.setMaxStopTimeMs(maxStopTime);
+    threadPool.setDaemon(true);
     webServer.setThreadPool(threadPool);
 
     final String appDir = getWebAppsPath();
@@ -153,11 +167,20 @@ public class HttpServer implements FilterContainer {
    */
   protected Connector createBaseListener(Configuration conf)
       throws IOException {
-    SelectChannelConnector ret = new SelectChannelConnector();
+    Connector ret;
+    if (conf.getBoolean("hadoop.http.bio", false)) {
+      SocketConnector conn = new SocketConnector();
+      conn.setAcceptQueueSize(4096);
+      conn.setResolveNames(false);
+      ret = conn;
+    } else {
+      SelectChannelConnector conn = new SelectChannelConnector();
+      conn.setAcceptQueueSize(128);
+      conn.setResolveNames(false);
+      conn.setUseDirectBuffers(false);
+      ret = conn;
+    }
     ret.setLowResourceMaxIdleTime(10000);
-    ret.setAcceptQueueSize(128);
-    ret.setResolveNames(false);
-    ret.setUseDirectBuffers(false);
     ret.setHeaderBufferSize(conf.getInt("hadoop.http.header.buffer.size", 4096));
     ret.setMaxIdleTime(conf.getInt("dfs.http.timeout", 200000));
     return ret;
@@ -194,13 +217,13 @@ public class HttpServer implements FilterContainer {
     if (logDir != null) {
       Context logContext = new Context(parent, "/logs");
       logContext.setResourceBase(logDir);
-      logContext.addServlet(DefaultServlet.class, "/");
+      logContext.addServlet(StaticServlet.class, "/");
       defaultContexts.put(logContext, true);
     }
     // set up the context for "/static/*"
     Context staticContext = new Context(parent, "/static");
     staticContext.setResourceBase(appDir + "/static");
-    staticContext.addServlet(DefaultServlet.class, "/*");
+    staticContext.addServlet(StaticServlet.class, "/*");
     defaultContexts.put(staticContext, true);
   }
   
@@ -211,9 +234,10 @@ public class HttpServer implements FilterContainer {
     // set up default servlets
     addServlet("stacks", "/stacks", StackServlet.class);
     addServlet("logLevel", "/logLevel", LogLevel.Servlet.class);
+    addServlet("jmx", "/jmx", JMXJsonServlet.class);
     addServlet("metrics", "/metrics", MetricsServlet.class);
-		 addServlet("conf", "/conf", ConfServlet.class);
-	}
+    addServlet("conf", "/conf", ConfServlet.class);
+    }
 
   public void addContext(Context ctxt, boolean isFiltered)
       throws IOException {
@@ -275,6 +299,102 @@ public class HttpServer implements FilterContainer {
       holder.setName(name);
     }
     webAppContext.addServlet(holder, pathSpec);
+  }
+
+  /**
+   * Remove a servlet in the server.
+   * @param name The name of the servlet (can be passed as null)
+   * @param pathSpec The path spec for the servlet
+   * @param clazz The servlet class
+   */
+  public void removeServlet(String name, String pathSpec,
+      Class<? extends HttpServlet> clazz) {
+    if(clazz == null) {
+       return;
+    }
+
+    //remove the filters from filterPathMapping
+    ServletHandler servletHandler = webAppContext.getServletHandler();
+    List<FilterMapping> newFilterMappings = new ArrayList<FilterMapping>();
+
+    //only add the filter whose pathSpec is not the to-be-removed servlet
+    for(FilterMapping mapping: servletHandler.getFilterMappings()) {
+      for(String mappingPathSpec: mapping.getPathSpecs()) {
+        if(!mappingPathSpec.equals(pathSpec)){
+          newFilterMappings.add(mapping);
+        }
+      }
+    }
+  
+    servletHandler.setFilterMappings(newFilterMappings.toArray(new FilterMapping[newFilterMappings.size()]));
+
+    removeInternalServlet(name, pathSpec, clazz);
+  }
+
+  /**
+   * Remove an internal servlet in the server.
+   * @param clazz The servlet class
+   */
+  public void removeInternalServlet(String name, String pathSpec,
+      Class<? extends HttpServlet> clazz) {
+    if(null == clazz) {
+      return;
+    }
+
+    ServletHandler servletHandler = webAppContext.getServletHandler();
+    List<ServletHolder> newServletHolders = new ArrayList<ServletHolder>();     
+    List<ServletMapping> newServletMappings = new ArrayList<ServletMapping>();
+    String clazzName = clazz.getName();
+    Set<String> holdersToRemove = new HashSet<String>();
+
+    //find all the holders that hold the servlet to be removed
+    for(ServletHolder holder : servletHandler.getServlets()) {
+      try{
+        if(clazzName.equals(holder.getServlet().getClass().getName())
+          && name.equals(holder.getName())) {
+          holdersToRemove.add(holder.getName());
+        } else {
+          newServletHolders.add(holder);
+        }      
+      } catch(ServletException e) {
+        LOG.error("exception in removeInternalServlet() when iterating through" +
+                  "servlet holders" + StringUtils.stringifyException(e));
+      }
+    }    
+  
+    //if there is no holder to be removed, then the servlet does not exist in 
+    //current context
+    if(holdersToRemove.size() < 1) {
+      return;
+    }
+  
+    //only add the servlet mapping if it is not to be removed
+    for(ServletMapping mapping : servletHandler.getServletMappings()) {
+      //if the mapping's servlet is not to be removed, add to new mappings
+      if(!holdersToRemove.contains(mapping.getServletName())) {
+          newServletMappings.add(mapping);
+      } else {
+        String[] pathSpecs = mapping.getPathSpecs();
+        boolean pathSpecMatched = false;
+        if(pathSpecs != null && pathSpecs.length > 0) {
+          for(String pathSpecInMapping: pathSpecs) {
+            if(pathSpecInMapping.equals(pathSpec)) {
+              pathSpecMatched = true;
+              break;
+            }
+          }
+        }
+        //if the pathspec does not match, then add to the new mappings
+        if(!pathSpecMatched) {
+          newServletMappings.add(mapping);
+        }
+      }
+    }
+    
+    servletHandler.setServletMappings(
+        newServletMappings.toArray(new ServletMapping[newServletMappings.size()]));
+    servletHandler.setServlets(
+        newServletHolders.toArray(new ServletHolder[newServletHolders.size()]));
   }
 
   /** {@inheritDoc} */
@@ -379,6 +499,18 @@ public class HttpServer implements FilterContainer {
     pool.setMaxThreads(max);
   }
 
+  public int getQueueSize() {
+    return ((QueuedThreadPool) webServer.getThreadPool()).getQueueSize();
+  }
+
+  public int getThreads() {
+    return ((QueuedThreadPool) webServer.getThreadPool()).getThreads();
+  }
+
+  public boolean isLowOnThreads() {
+    return ((QueuedThreadPool) webServer.getThreadPool()).isLowOnThreads();
+  }
+
   /**
    * Configure an ssl listener on the server.
    * @param addr address to listen on
@@ -394,7 +526,7 @@ public class HttpServer implements FilterContainer {
       throw new IOException("Failed to add ssl listener");
     }
     SslSocketConnector sslListener = new SslSocketConnector();
-    sslListener.setHost(addr.getHostName());
+    sslListener.setHost(addr.getAddress().getHostAddress());
     sslListener.setPort(addr.getPort());
     sslListener.setKeystore(keystore);
     sslListener.setPassword(storPass);
@@ -423,7 +555,7 @@ public class HttpServer implements FilterContainer {
           "ssl.server.truststore.type", "jks"));
     }
     SslSocketConnector sslListener = new SslSocketConnector();
-    sslListener.setHost(addr.getHostName());
+    sslListener.setHost(addr.getAddress().getHostAddress());
     sslListener.setPort(addr.getPort());
     sslListener.setKeystore(sslConf.get("ssl.server.keystore.location"));
     sslListener.setPassword(sslConf.get("ssl.server.keystore.password", ""));
@@ -582,6 +714,7 @@ public class HttpServer implements FilterContainer {
    * all of the servlets resistant to cross-site scripting attacks.
    */
   public static class QuotingInputFilter implements Filter {
+    private FilterConfig config;
 
     public static class RequestQuoter extends HttpServletRequestWrapper {
       private final HttpServletRequest rawRequest;
@@ -624,6 +757,9 @@ public class HttpServer implements FilterContainer {
       public String[] getParameterValues(String name) {
         String unquoteName = HtmlQuoting.unquoteHtmlChars(name);
         String[] unquoteValue = rawRequest.getParameterValues(unquoteName);
+        if (unquoteValue == null) {
+          return null;
+        }
         String[] result = new String[unquoteValue.length];
         for(int i=0; i < result.length; ++i) {
           result[i] = HtmlQuoting.quoteHtmlChars(unquoteValue[i]);
@@ -669,6 +805,7 @@ public class HttpServer implements FilterContainer {
 
     @Override
     public void init(FilterConfig config) throws ServletException {
+      this.config = config;
     }
 
     @Override
@@ -682,12 +819,34 @@ public class HttpServer implements FilterContainer {
                          ) throws IOException, ServletException {
       HttpServletRequestWrapper quoted = 
         new RequestQuoter((HttpServletRequest) request);
-      final HttpServletResponse httpResponse = (HttpServletResponse) response;
-      // set the default to UTF-8 so that we don't need to worry about IE7
-      // choosing to interpret the special characters as UTF-7
-      httpResponse.setContentType("text/html;charset=utf-8");
-      chain.doFilter(quoted, response);
+      HttpServletResponse httpResponse = (HttpServletResponse) response;
+
+      String mime = inferMimeType(request);
+      if (mime == null) {
+        httpResponse.setContentType("text/html; charset=utf-8");
+      } else if (mime.startsWith("text/html")) {
+        // HTML with unspecified encoding, we want to
+        // force HTML with utf-8 encoding
+        // This is to avoid the following security issue:
+        // http://openmya.hacker.jp/hasegawa/security/utf7cs.html
+        httpResponse.setContentType("text/html; charset=utf-8");
+      } else if (mime.startsWith("application/xml")) {
+        httpResponse.setContentType("text/xml; charset=utf-8");
+      }
+      chain.doFilter(quoted, httpResponse);
     }
 
+    /**
+     * Infer the mime type for the response based on the extension of the 
+     * request URI. Returns null if unknown.
+     */
+    private String inferMimeType(ServletRequest request) {
+      String path = ((HttpServletRequest)request).getRequestURI();
+      ContextHandler.SContext sContext = 
+        (ContextHandler.SContext)config.getServletContext();
+      MimeTypes mimes = sContext.getContextHandler().getMimeTypes();
+      Buffer mimeBuffer = mimes.getMimeByExtension(path);
+      return (mimeBuffer == null) ? null : mimeBuffer.toString();
+    }
   }
 }

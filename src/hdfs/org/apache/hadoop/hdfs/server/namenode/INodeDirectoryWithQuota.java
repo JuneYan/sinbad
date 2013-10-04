@@ -25,7 +25,7 @@ import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
 /**
  * Directory INode class that has a quota restriction
  */
-class INodeDirectoryWithQuota extends INodeDirectory {
+public class INodeDirectoryWithQuota extends INodeDirectory {
   private long nsQuota; /// NameSpace quota
   private long nsCount;
   private long dsQuota; /// disk space quota
@@ -49,20 +49,20 @@ class INodeDirectoryWithQuota extends INodeDirectory {
   
   /** constructor with no quota verification */
   INodeDirectoryWithQuota(
-      PermissionStatus permissions, long modificationTime, 
+      long id, PermissionStatus permissions, long modificationTime, 
       long nsQuota, long dsQuota)
   {
-    super(permissions, modificationTime);
+    super(id, permissions, modificationTime);
     this.nsQuota = nsQuota;
     this.dsQuota = dsQuota;
     this.nsCount = 1;
   }
   
   /** constructor with no quota verification */
-  INodeDirectoryWithQuota(String name, PermissionStatus permissions, 
+  INodeDirectoryWithQuota(long id, String name, PermissionStatus permissions, 
                           long nsQuota, long dsQuota)
   {
-    super(name, permissions);
+    super(id, name, permissions);
     this.nsQuota = nsQuota;
     this.dsQuota = dsQuota;
     this.nsCount = 1;
@@ -104,11 +104,11 @@ class INodeDirectoryWithQuota extends INodeDirectory {
   /** Get the number of names in the subtree rooted at this directory
    * @return the size of the subtree rooted at this directory
    */
-  long numItemsInTree() {
+  public long numItemsInTree() {
     return nsCount;
   }
   
-  long diskspaceConsumed() {
+  public long diskspaceConsumed() {
     return diskspace;
   }
   
@@ -120,16 +120,6 @@ class INodeDirectoryWithQuota extends INodeDirectory {
   void updateNumItemsInTree(long nsDelta, long dsDelta) {
     nsCount += nsDelta;
     diskspace += dsDelta;
-  }
-
-  /** Update the size of the tree
-   * 
-   * @param nsDelta the change of the tree size
-   * @param dsDelta change to disk space occupied
-   **/
-  void unprotectedUpdateNumItemsInTree(long nsDelta, long dsDelta) {
-    nsCount = nsCount + nsDelta;
-    diskspace = diskspace + dsDelta;
   }
   
   /** 

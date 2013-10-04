@@ -18,30 +18,39 @@
 
 package org.apache.hadoop.streaming;
 
-import java.io.*;
-import java.nio.charset.CharacterCodingException;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.File;
 import java.io.IOException;
-import java.util.Date;
-import java.util.Map;
-import java.util.Iterator;
-import java.util.Arrays;
+import java.io.InputStream;
+import java.io.PrintStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.nio.charset.CharacterCodingException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.Iterator;
+import java.util.Map;
 import java.util.Properties;
 
-import org.apache.commons.logging.*;
-
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FileUtil;
+import org.apache.hadoop.io.BytesWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.serializer.Serializer;
 import org.apache.hadoop.mapred.JobConf;
-import org.apache.hadoop.mapred.Reporter;
 import org.apache.hadoop.mapred.OutputCollector;
+import org.apache.hadoop.mapred.Reporter;
 import org.apache.hadoop.util.LineReader;
+import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.UTF8ByteArrayUtils;
-
-import org.apache.hadoop.io.Text;
-import org.apache.hadoop.io.BytesWritable;
-
-import org.apache.hadoop.fs.FileSystem;
 
 /** Shared functionality for PipeMapper, PipeReducer.
  */
@@ -65,6 +74,23 @@ public abstract class PipeMapRed {
   final static int DOUBLEQ = 3;
   
   private final static int BUFFER_SIZE = 128 * 1024;
+
+  Serializer<Object> clientInputSerializer;
+  
+  boolean useBytesWritable = false;
+  
+  /** "map" or "reduce", used for creating configuration keys */
+  private final String mapOrReduce;
+
+  /** Whether to skip outputting a new line in the input to the user process */
+  protected boolean ignoreNewLine;
+  
+  /** Whether to skip outputting the key in the input to the user process */
+  protected boolean ignoreKey;
+
+  PipeMapRed(String mapOrReduce) { 
+    this.mapOrReduce = mapOrReduce;
+  }
 
   static String[] splitArgs(String args) {
     ArrayList argList = new ArrayList();
@@ -122,6 +148,12 @@ public abstract class PipeMapRed {
       fs_ = FileSystem.get(job_);
 
       nonZeroExitIsFailure_ = job_.getBoolean("stream.non.zero.exit.is.failure", true);
+      String key_val_class = job_.get("stream.key_value.class", "Text");
+      if (key_val_class.equalsIgnoreCase("BytesWritable")) {
+        useBytesWritable = true;
+      } else {
+        useBytesWritable = false;
+      }
       
       doPipe_ = getDoPipe();
       if (!doPipe_) return;
@@ -176,6 +208,8 @@ public abstract class PipeMapRed {
 
       errThread_ = new MRErrorThread();
       errThread_.start();
+
+      configureSerializer("stream." + mapOrReduce + ".input.serializer.class", job);
     } catch (Exception e) {
       logStackTrace(e);
       LOG.error("configuration exception", e);
@@ -191,6 +225,8 @@ public abstract class PipeMapRed {
       logprintln("JobConf set minRecWrittenToEnableSkip_ =" + minRecWrittenToEnableSkip_);
     }
     taskId_ = StreamUtil.getTaskInfo(job_);
+    ignoreNewLine = job.getBoolean("stream." + mapOrReduce + ".input.ignoreNewLine", false);
+    ignoreKey = job.getBoolean("stream." + mapOrReduce + ".input.ignoreKey", false);
   }
 
   void logStackTrace(Exception e) {
@@ -359,6 +395,29 @@ public abstract class PipeMapRed {
     }
   }
 
+  void splitKeyVal(byte[] line, int length, BytesWritable key, BytesWritable val)
+  throws IOException {
+    int numKeyFields = getNumOfKeyFields();
+    byte[] separator = getFieldSeparator();
+    
+    // Need to find numKeyFields separators
+    int pos = UTF8ByteArrayUtils.findBytes(line, 0, length, separator);
+    for(int k=1; k<numKeyFields && pos!=-1; k++) {
+      pos = UTF8ByteArrayUtils.findBytes(line, pos + separator.length, 
+          length, separator);
+    }
+    try {
+      if (pos == -1) {
+        key.set(line, 0, length);
+        val.set(new byte[0], 0, 0);
+      } else {
+        StreamKeyValUtil.splitKeyVal(line, 0, length, key, val, pos, separator.length);
+      }
+    } catch (CharacterCodingException e) {
+      LOG.warn(StringUtils.stringifyException(e));
+    }
+  }
+
   class MROutputThread extends Thread {
 
     MROutputThread(OutputCollector output, Reporter reporter) {
@@ -370,15 +429,22 @@ public abstract class PipeMapRed {
     public void run() {
       LineReader lineReader = null;
       try {
-        Text key = new Text();
-        Text val = new Text();
         Text line = new Text();
         lineReader = new LineReader((InputStream)clientIn_, job_);
         // 3/4 Tool to Hadoop
         while (lineReader.readLine(line) > 0) {
           answer = line.getBytes();
-          splitKeyVal(answer, line.getLength(), key, val);
-          output.collect(key, val);
+          if (useBytesWritable) {
+            BytesWritable key = new BytesWritable();
+            BytesWritable val = new BytesWritable();
+            splitKeyVal(answer, line.getLength(), key, val);
+            output.collect(key, val);
+          } else {
+            Text key = new Text();
+            Text val = new Text();
+            splitKeyVal(answer, line.getLength(), key, val);
+            output.collect(key, val);
+          }
           line.clear();
           numRecWritten_++;
           long now = System.currentTimeMillis();
@@ -556,9 +622,9 @@ public abstract class PipeMapRed {
       logprintln(info);
       logflush();
       if (nextRecReadLog_ < 100000) {
-	  nextRecReadLog_ *= 10;
+        nextRecReadLog_ *= 10;
       } else {
-	  nextRecReadLog_ += 100000;
+        nextRecReadLog_ += 100000;
       }
     }
   }
@@ -612,6 +678,11 @@ public abstract class PipeMapRed {
    * @throws IOException
    */
   void write(Object value) throws IOException {
+    if (clientInputSerializer != null) {
+      clientInputSerializer.serialize(value);
+      return;
+    }
+
     byte[] bval;
     int valSize;
     if (value instanceof BytesWritable) {
@@ -628,6 +699,25 @@ public abstract class PipeMapRed {
       valSize = bval.length;
     }
     clientOut_.write(bval, 0, valSize);
+  }
+
+  @SuppressWarnings({ "rawtypes", "unchecked" })
+  void configureSerializer(String confKey, Configuration conf) {
+    Class clientInputSerializerClass = conf.getClass(confKey, null);
+    if (clientInputSerializerClass != null) {
+      LOG.info("Using custom serializer: " + clientInputSerializerClass.getName());
+      clientInputSerializer = 
+          (Serializer) ReflectionUtils.newInstance(clientInputSerializerClass, conf);
+
+      try {
+        clientInputSerializer.open(clientOut_);
+      } catch (IOException e) {
+        LOG.error("Could not open serializer", e);
+        throw new RuntimeException(e);
+      }
+    } else {
+      LOG.info("Not using a custom serializer");
+    }
   }
 
   long startTime_;

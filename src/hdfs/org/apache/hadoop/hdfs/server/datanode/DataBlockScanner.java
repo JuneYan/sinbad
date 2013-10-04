@@ -47,11 +47,12 @@ import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.server.datanode.FSDataset.FSVolume;
-import org.apache.hadoop.hdfs.util.DataTransferThrottler;
+import org.apache.hadoop.hdfs.server.datanode.metrics.DatanodeThreadLivenessReporter.BackgroundThread;
 import org.apache.hadoop.hdfs.util.LightWeightHashSet;
 import org.apache.hadoop.hdfs.util.LightWeightLinkedSet;
 import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.util.StringUtils;
+import org.apache.hadoop.util.DataTransferThrottler;
 
 /**
  * Performs two types of scanning:
@@ -263,7 +264,7 @@ class DataBlockScanner {
     }
     
     synchronized (this) {
-      throttler = new DataTransferThrottler(200, MAX_SCAN_RATE);
+      throttler = new DataTransferThrottler(MAX_SCAN_RATE);
     }
   }
   
@@ -272,7 +273,7 @@ class DataBlockScanner {
      * the scan period. Otherwise something sooner.
      */
     long period = Math.min(scanPeriod, 
-                           Math.max(blockMap.size(),1) * 600 * 1000L);
+                           Math.max(blockMap.size(),1) * 600L * 1000L);
     return System.currentTimeMillis() - scanPeriod + 
            random.nextInt((int)period);    
   }
@@ -390,6 +391,10 @@ class DataBlockScanner {
   }
   
   private void handleScanFailure(Block block) {
+    reportBadBlocks(block, namespaceId, datanode);
+  }
+
+  static void reportBadBlocks(Block block, int namespaceId, DataNode datanode) {
     
     LOG.info("Reporting bad block " + block + " to namenode.");
     
@@ -405,7 +410,8 @@ class DataBlockScanner {
                " Exception : " + StringUtils.stringifyException(e));
     }
   }
-    
+
+  
   static private class LogEntry {
     long blockId = -1;
     long verificationTime = -1;
@@ -472,6 +478,11 @@ class DataBlockScanner {
       
       try {
         adjustThrottler();
+        
+        if (!datanode.data.isValidBlock(namespaceId, block, true)) {
+          throw new IOException(
+              "Block is not a valid block or in-memroy size unmatch");
+        }
         
         blockSender = new BlockSender(namespaceId, block, 0, -1, false, 
                                                false, true, datanode);
@@ -585,7 +596,7 @@ class DataBlockScanner {
     try {
       for (LogFileHandler.Reader reader : logReader) {
       // update verification times from the verificationLog.
-        while (logReader != null && reader.hasNext()) {
+        while (reader != null && reader.hasNext()) {
           if (!datanode.shouldRun
               || datanode.blockScanner.blockScannerThread.isInterrupted()) {
             return false;
@@ -687,6 +698,8 @@ class DataBlockScanner {
       while (datanode.shouldRun && !Thread.interrupted()
           && datanode.isNamespaceAlive(namespaceId)
           ) {
+        datanode.updateAndReportThreadLiveness(BackgroundThread.BLOCK_SCANNER);
+
         long now = System.currentTimeMillis();
         synchronized (this) {
           if ( now >= (currentPeriodStart + scanPeriod)) {

@@ -19,22 +19,31 @@
 package org.apache.hadoop.ipc;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.net.ConnectException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
 import junit.framework.TestCase;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Hashtable;
+import java.util.List;
 import java.util.concurrent.atomic.*;
 
 import org.apache.commons.logging.*;
+import org.apache.commons.logging.impl.Log4JLogger;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
+import org.apache.hadoop.hdfs.util.InjectionEvent;
+import org.apache.hadoop.io.BooleanWritable;
 import org.apache.hadoop.io.UTF8;
 import org.apache.hadoop.io.Writable;
 
@@ -45,20 +54,28 @@ import org.apache.hadoop.security.authorize.ConfiguredPolicy;
 import org.apache.hadoop.security.authorize.PolicyProvider;
 import org.apache.hadoop.security.authorize.Service;
 import org.apache.hadoop.security.authorize.ServiceAuthorizationManager;
+import org.apache.hadoop.util.InjectionEventCore;
+import org.apache.hadoop.util.InjectionEventI;
+import org.apache.hadoop.util.InjectionHandler;
+import org.apache.log4j.Level;
+
+import org.junit.Test;
+import static org.junit.Assert.*;
 
 /** Unit tests for RPC. */
-public class TestRPC extends TestCase {
+public class TestRPC {
   private static final String ADDRESS = "0.0.0.0";
 
   public static final Log LOG =
     LogFactory.getLog(TestRPC.class);
-  
+  {
+    ((Log4JLogger)Client.CLIENT_TRACE_LOG).getLogger().setLevel(Level.ALL);
+  }
+
   private static Configuration conf = new Configuration();
 
   int datasize = 1024*100;
   int numThreads = 50;
-
-  public TestRPC(String name) { super(name); }
 	
   public interface TestProtocol extends VersionedProtocol {
     public static final long versionID = 1L;
@@ -73,6 +90,7 @@ public class TestRPC extends TestCase {
     int error() throws IOException;
     void testServerGet() throws IOException;
     int[] exchange(int[] values) throws IOException;
+    BooleanWritable test(BooleanWritable e) throws IOException;
   }
 
   public class TestImpl implements TestProtocol {
@@ -98,7 +116,7 @@ public class TestRPC extends TestCase {
       }
     }
     
-    public String echo(String value) throws IOException { return value; }
+    public String echo(String value) throws IOException { LOG.info("-----value: " + value); return value; }
 
     public String[] echo(String[] values) throws IOException { return values; }
 
@@ -138,6 +156,11 @@ public class TestRPC extends TestCase {
         long clientVersion, int clientMethodsHash) throws IOException {
       return ProtocolSignature.getProtocolSignature(
           this, protocol, clientVersion, clientMethodsHash);
+    }
+
+    @Override
+    public BooleanWritable test(BooleanWritable e) throws IOException {
+      return e;
     }
   }
 
@@ -198,8 +221,9 @@ public class TestRPC extends TestCase {
     }
   }
 
+  @Test
   public void testSlowRpc() throws Exception {
-    System.out.println("Testing Slow RPC");
+    System.out.println("Testing Slow RPC"); 
     // create a server with two handlers
     Server server = RPC.getServer(new TestImpl(), ADDRESS, 0, 2, false, conf);
     TestProtocol proxy = null;
@@ -240,10 +264,153 @@ public class TestRPC extends TestCase {
       System.out.println("Down slow rpc testing");
     }
   }
+  
+  @Test
+  public void testNRpcClients() throws Exception {
+    testMultiRpc(100);
+  }
+  
+  @Test
+  public void test1RpcClient() throws Exception {
+    testMultiRpc(1);
+  }
 
+  private void testMultiRpc(int clientCount) throws Exception {
+    System.out.println("Testing RPC");
+    // create a server with two handlers
+    Server server = null;
 
-  public void testCalls() throws Exception {
+    try {
+      server = RPC.getServer(new TestImpl(), ADDRESS, 0, 3, false, conf);
+      server.start();
+
+      InetSocketAddress addr = NetUtils.getConnectAddress(server);
+
+      // create a client
+      List<Thread> clientThreads = new ArrayList<Thread>();
+      List<RPCClient> clients = new ArrayList<RPCClient>();
+      long start = System.currentTimeMillis();
+
+      for (int i = 0; i < clientCount; i++) {
+        RPCClient cli = new RPCClient(addr);
+        Thread t = new Thread(cli);
+        clients.add(cli);
+        clientThreads.add(t);
+        t.start();
+      }
+      for (Thread t : clientThreads) {
+        t.join();
+      }
+      long stop = System.currentTimeMillis();
+      System.out.println("----------- time taken : " + (stop-start));
+    } finally {
+      if (server != null) {
+        server.stop();
+      }
+    }
+  }
+  
+  class RPCClient implements Runnable {
+    TestProtocol proxy = null;
+    volatile boolean running = true;
+
+    public RPCClient(InetSocketAddress addr) throws IOException {
+      // create a client
+      proxy = (TestProtocol) RPC.getProxy(TestProtocol.class,
+          TestProtocol.versionID, addr, conf);
+    }
+
+    public void stop() {
+      running = false;
+    }
+
+    @Override
+    public void run() {
+      try {
+        BooleanWritable e = new BooleanWritable();
+        for (int i = 0; i < 1000; i++) {
+          proxy.ping();
+          proxy.test(e);
+        }
+      } catch (IOException e) {
+        System.out.println("Exception: " + e);
+      } finally {
+        if (proxy != null) {
+          RPC.stopProxy(proxy);
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testDnsUpdate() throws Exception {
+    int oldMaxRetry = conf.getInt("ipc.client.connect.max.retries", 10);
+    int oldmaxidletime = conf.getInt("ipc.client.connection.maxidletime", 10000);
+    InetAddress oldAddr = null;
+    InetSocketAddress addr = null;
+    
     Server server = RPC.getServer(new TestImpl(), ADDRESS, 0, conf);
+    TestProtocol proxy = null;
+    try {
+      server.start();
+
+      addr = NetUtils.getConnectAddress(server);
+      oldAddr = addr.getAddress();
+
+      conf.setInt("ipc.client.connect.max.retries", 0);
+      conf.setInt("ipc.client.connection.maxidletime", 500);
+      proxy = (TestProtocol) RPC.getProxy(TestProtocol.class,
+          TestProtocol.versionID, addr, conf);
+
+      proxy.ping();
+      
+      // Since we change the addr object. We have to wait for the
+      // connection cache to expire before we issue issue RPC.
+      // In real case it is not necessary since addr won't change.
+      Thread.sleep(1000);
+      
+      Field addressField = addr.getClass().getDeclaredField("addr");
+      addressField.setAccessible(true);
+      addressField.set(addr, InetAddress.getByName("facebook.com"));
+      Field hostField = addr.getClass().getDeclaredField("hostname");
+      hostField.setAccessible(true);
+      hostField.set(addr, "localhost");
+
+      try {
+        proxy.echo("foo");
+        TestCase.fail();
+      } catch (IOException e) {
+        LOG.info("Caught " + e);
+      }
+
+      String stringResult = proxy.echo("foo");
+      TestCase.assertEquals("foo", stringResult);
+
+      try {
+        proxy.error();
+        TestCase.fail();
+      } catch (IOException e) {
+        LOG.debug("Caught " + e);
+      }
+    } finally {
+      server.stop();
+      if (proxy != null)
+        RPC.stopProxy(proxy);
+
+      conf.setInt("ipc.client.connect.max.retries", oldMaxRetry);
+      conf.setInt("ipc.client.connection.maxidletime", oldmaxidletime);
+    }
+  }
+
+  @Test
+  public void testCalls() throws Exception {
+    testCallsInternal(true);
+    testCallsInternal(false);
+  }
+  
+  private void testCallsInternal(boolean supportOldJobConf) throws Exception {
+    Server server = RPC.getServer(new TestImpl(), ADDRESS, 0, 1, false, conf,
+        supportOldJobConf);
     TestProtocol proxy = null;
     try {
     server.start();
@@ -325,7 +492,56 @@ public class TestRPC extends TestCase {
       if(proxy!=null) RPC.stopProxy(proxy);
     }
   }
+ 
+  @Test
+  public void testIOSetupFailure() throws Exception {
+    SecurityUtil.setPolicy(new ConfiguredPolicy(conf, new TestPolicyProvider()));
+    
+    Server server = RPC.getServer(new TestImpl(), ADDRESS, 0, 5, true, conf);
+
+    TestProtocol proxy = null;
+
+    server.start();
+
+    InetSocketAddress addr = NetUtils.getConnectAddress(server);
+    
+    final AtomicReference<Hashtable> hashtable = new AtomicReference<Hashtable>(
+        null);
+    try {
+      InjectionHandler.set(new InjectionHandler() {
+        @Override
+        protected void _processEvent(InjectionEventI event, Object... args) {
+          if (event == InjectionEventCore.RPC_CLIENT_SETUP_IO_STREAM_FAILURE) {
+            hashtable.set((Hashtable) args[0]);
+            throw new RuntimeException("testIOSetupFailure");
+          }
+        }
+      });
+      
+      try {
+        proxy = (TestProtocol)RPC.getProxy(
+            TestProtocol.class, TestProtocol.versionID, addr, conf);
+        proxy.ping();
+        TestCase.fail();
+      } catch (RuntimeException e) {
+        if (!e.getMessage().equals("testIOSetupFailure")) {
+          throw e;
+        }
+      }
+      InjectionHandler.clear();
+      TestCase
+          .assertNotNull("inject handler is not triggered", hashtable.get());
+      TestCase.assertTrue("Connection is not cleared.", hashtable.get()
+          .isEmpty());
+    } finally {
+      server.stop();
+      if (proxy != null) {
+        RPC.stopProxy(proxy);
+      }
+    }
+  }
   
+  @Test
   public void testStandaloneClient() throws IOException {
     try {
       RPC.waitForProxy(TestProtocol.class,
@@ -380,6 +596,7 @@ public class TestRPC extends TestCase {
     }
   }
   
+  @Test
   public void testAuthorization() throws Exception {
     Configuration conf = new Configuration();
     conf.setBoolean(
@@ -394,6 +611,7 @@ public class TestRPC extends TestCase {
     doRPCs(conf, true);
   }
   
+  @Test
   public void testRPCInterrupted() throws IOException, InterruptedException {
     final MiniDFSCluster cluster;
     Configuration conf = new Configuration();
@@ -413,12 +631,14 @@ public class TestRPC extends TestCase {
               fs.listStatus(new Path("/"));
             }
           } catch (IOException e) {
-            if (e.getCause() instanceof InterruptedException) {
+            if (e instanceof InterruptedIOException
+                || e.getCause() instanceof InterruptedException) {
               // the underlying InterruptedException should be wrapped to an
               // IOException and end up here
               passed.set(true);
             } else {
               passed.set(false);
+              LOG.error(e);
               fail(e.getMessage());
             }
           } finally {
@@ -449,8 +669,6 @@ public class TestRPC extends TestCase {
   }
 
   public static void main(String[] args) throws Exception {
-
-    new TestRPC("test").testCalls();
-
+    new TestRPC().testCalls();
   }
 }

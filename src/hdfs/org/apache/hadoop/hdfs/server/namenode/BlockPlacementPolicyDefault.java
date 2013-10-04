@@ -23,6 +23,7 @@ import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+import org.apache.hadoop.hdfs.server.namenode.BlockPlacementPolicy.NotEnoughReplicasException;
 import org.apache.hadoop.net.DNSToSwitchMapping;
 import org.apache.hadoop.net.NetworkTopology;
 import org.apache.hadoop.net.Node;
@@ -44,6 +45,7 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
   protected NetworkTopology clusterMap;
   private FSClusterStats stats;
   private int attemptMultiplier = 0;
+  private int minBlocksToWrite = FSConstants.MIN_BLOCKS_FOR_WRITE;
 
   BlockPlacementPolicyDefault(Configuration conf,  FSClusterStats stats,
                            NetworkTopology clusterMap) {
@@ -58,10 +60,13 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
       NetworkTopology clusterMap, HostsFileReader hostsReader,
       DNSToSwitchMapping dnsToSwitchMapping, FSNamesystem ns) {
     this.considerLoad = conf.getBoolean("dfs.replication.considerLoad", true);
+    this.minBlocksToWrite = conf.getInt("dfs.replication.minBlocksToWrite",
+                                        FSConstants.MIN_BLOCKS_FOR_WRITE);                                        
     this.stats = stats;
     this.clusterMap = clusterMap;
     Configuration newConf = new Configuration();
     this.attemptMultiplier = newConf.getInt("dfs.replication.attemptMultiplier", 200);
+    FSNamesystem.LOG.info("Value for min blocks to write " + this.minBlocksToWrite);
   }
 
   @Override
@@ -99,7 +104,58 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
                                     long blocksize) {
     return chooseTarget(numOfReplicas, writer, chosenNodes, null, blocksize);
   }
-    
+
+  final protected int[] getActualReplicas(int numOfReplicas,
+      List<DatanodeDescriptor> chosenNodes) {
+    int clusterSize = clusterMap.getNumOfLeaves();
+    int totalNumOfReplicas = chosenNodes.size() + numOfReplicas;
+    if (totalNumOfReplicas > clusterSize) {
+      numOfReplicas -= (totalNumOfReplicas - clusterSize);
+      totalNumOfReplicas = clusterSize;
+    }
+
+    int maxNodesPerRack = (totalNumOfReplicas - 1) / clusterMap.getNumOfRacks()
+        + 2;
+    return new int[] { numOfReplicas, maxNodesPerRack };
+  }
+
+  final protected void updateExcludedAndChosen(List<Node> exlcNodes,
+      HashMap<Node, Node> excludedNodes, List<DatanodeDescriptor> results,
+      List<DatanodeDescriptor> chosenNodes) {
+    if (exlcNodes != null) {
+      for (Node node : exlcNodes) {
+        excludedNodes.put(node, node);
+      }
+    }
+
+    for (DatanodeDescriptor node : chosenNodes) {
+      excludedNodes.put(node, node);
+      if ((!node.isDecommissionInProgress()) && (!node.isDecommissioned())) {
+        results.add(node);
+      }
+    }
+  }
+
+  final protected DatanodeDescriptor[] finalizeTargets(
+      List<DatanodeDescriptor> results, List<DatanodeDescriptor> chosenNodes,
+      DatanodeDescriptor writer, DatanodeDescriptor localNode, long blocksize) {
+    results.removeAll(chosenNodes);
+
+    // sorting nodes to form a pipeline
+    DatanodeDescriptor[] pipeline = results
+        .toArray(new DatanodeDescriptor[results.size()]);
+    clusterMap.getPipeline((writer == null) ? localNode : writer, pipeline);
+
+    // Update network usage of the selected ones 
+    for (DatanodeDescriptor dd: pipeline) {
+      // Bump up the RxBps based on blocksize
+      LOG.info("chooseTarget selected " + dd.getName() + " with RxBps = " + getDnRxBps(dd.getName()));
+      adjustRxBps(dd.getName(), blocksize);
+    }
+
+    return pipeline;
+  }
+
   /**
    * This is not part of the public API but is used by the unit tests.
    */
@@ -111,93 +167,100 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
     if (numOfReplicas == 0 || clusterMap.getNumOfLeaves()==0) {
       return new DatanodeDescriptor[0];
     }
+
+    int[] result = getActualReplicas(numOfReplicas, chosenNodes);
+    numOfReplicas = result[0];
+    int maxNodesPerRack = result[1];
       
     HashMap<Node, Node> excludedNodes = new HashMap<Node, Node>();
-    if (exlcNodes != null) {
-      for (Node node:exlcNodes) {
-        excludedNodes.put(node, node);
-      }
-    }
-     
-    int clusterSize = clusterMap.getNumOfLeaves();
-    int totalNumOfReplicas = chosenNodes.size()+numOfReplicas;
-    if (totalNumOfReplicas > clusterSize) {
-      numOfReplicas -= (totalNumOfReplicas-clusterSize);
-      totalNumOfReplicas = clusterSize;
-    }
-      
-    int maxNodesPerRack = 
-      (totalNumOfReplicas-1)/clusterMap.getNumOfRacks()+2;
-      
-    List<DatanodeDescriptor> results = 
-      new ArrayList<DatanodeDescriptor>(chosenNodes);
-    for (Node node:chosenNodes) {
-      excludedNodes.put(node, node);
-    }
-      
+    List<DatanodeDescriptor> results = new ArrayList<DatanodeDescriptor>(
+        chosenNodes.size() + numOfReplicas);
+
+    updateExcludedAndChosen(exlcNodes, excludedNodes, results, chosenNodes);
+
     if (!clusterMap.contains(writer)) {
       writer=null;
     }
       
     DatanodeDescriptor localNode = chooseTarget(numOfReplicas, writer, 
-                                                excludedNodes, blocksize, maxNodesPerRack, results);
-      
-    results.removeAll(chosenNodes);
-      
-    // sorting nodes to form a pipeline
-    DatanodeDescriptor[] selectedOnes = getPipeline((writer==null)?localNode:writer,
-                       results.toArray(new DatanodeDescriptor[results.size()]));
+                                                excludedNodes, blocksize, maxNodesPerRack, results,
+                                                chosenNodes.isEmpty());
 
-    // Update network usage of the selected ones 
-    for (DatanodeDescriptor dd: selectedOnes) {
-      // Bump up the RxBps based on blocksize
-      LOG.info("chooseTarget selected " + dd.getName() + " with RxBps = " + getDnRxBps(dd.getName()));
-      adjustRxBps(dd.getName(), blocksize);
-    }
-    
-    return selectedOnes;
+    return this.finalizeTargets(results, chosenNodes, writer, localNode, blocksize);
   }
     
+  /**
+   * all the chosen nodes are on the same rack, choose a node on a new rack for
+   * the next replica according to where the writer is
+   */
+  private void choose2ndRack(DatanodeDescriptor writer,
+      HashMap<Node, Node> excludedNodes,
+      long blocksize,
+      int maxNodesPerRack,
+      List<DatanodeDescriptor> results) throws NotEnoughReplicasException {
+    if (!clusterMap.isOnSameRack(writer, results.get(0))) {
+      DatanodeDescriptor localNode = chooseLocalNode(writer, excludedNodes,
+          blocksize, maxNodesPerRack, results);
+      if (clusterMap.isOnSameRack(localNode, results.get(0))) {
+        // should not put 2nd replica on the same rack as the first replica
+        results.remove(localNode); 
+      } else {
+        return;
+      }
+    }
+    chooseRemoteRack(1, results.get(0), excludedNodes, 
+        blocksize, maxNodesPerRack, results);
+  }
+
   /* choose <i>numOfReplicas</i> from all data nodes */
   protected DatanodeDescriptor chooseTarget(int numOfReplicas,
                                           DatanodeDescriptor writer,
                                           HashMap<Node, Node> excludedNodes,
                                           long blocksize,
                                           int maxNodesPerRack,
-                                          List<DatanodeDescriptor> results) {
+                                          List<DatanodeDescriptor> results,
+                                          boolean newBlock) {
       
     if (numOfReplicas == 0 || clusterMap.getNumOfLeaves()==0) {
       return writer;
     }
       
     int numOfResults = results.size();
-    boolean newBlock = (numOfResults==0);
+    boolean inClusterWriter = writer != null;
     if (writer == null && !newBlock) {
       writer = results.get(0);
     }
       
     try {
       if (numOfResults == 0) {
-        writer = chooseLocalNode(writer, excludedNodes, 
-                                 blocksize, maxNodesPerRack, results);
+        chooseLocalNode(writer, excludedNodes, 
+                        blocksize, maxNodesPerRack, results);
+        if (newBlock && writer == null) {
+          writer = results.get(0);
+        }
         if (--numOfReplicas == 0) {
           return writer;
         }
       }
       if (numOfResults <= 1) {
-        chooseRemoteRack(1, results.get(0), excludedNodes, 
-                         blocksize, maxNodesPerRack, results);
+        choose2ndRack(writer, excludedNodes,
+            blocksize, maxNodesPerRack, results);
         if (--numOfReplicas == 0) {
           return writer;
         }
       }
       if (numOfResults <= 2) {
         if (clusterMap.isOnSameRack(results.get(0), results.get(1))) {
-          chooseRemoteRack(1, results.get(0), excludedNodes,
-                           blocksize, maxNodesPerRack, results);
-        } else if (newBlock){
-          chooseLocalRack(results.get(1), excludedNodes, blocksize, 
+          choose2ndRack(writer, excludedNodes,
+              blocksize, maxNodesPerRack, results);
+        } else if (newBlock) {
+          if (inClusterWriter) {
+            place3rdReplicaForInClusterWriter(
+                excludedNodes, blocksize, maxNodesPerRack, results);
+          } else {
+            chooseLocalRack(results.get(1), excludedNodes, blocksize, 
                           maxNodesPerRack, results);
+          }
         } else {
           chooseLocalRack(writer, excludedNodes, blocksize,
                           maxNodesPerRack, results);
@@ -213,6 +276,26 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
                + numOfReplicas);
     }
     return writer;
+  }
+  
+  /**
+   * Place the third replica for a new block when the writer is 
+   * in the HDFS cluster and first two replicas are in the same rack
+   * The default policy places the third replica on the same rack
+   * as the 2nd replica
+   * 
+   * @param excludedNodes exluded nodes
+   * @param blocksize blocksize
+   * @param maxNodesPerRack max number of nodes per rack
+   * @param results chosen nodes
+   * @throws NotEnoughReplicasException
+   */
+  protected void place3rdReplicaForInClusterWriter(
+      HashMap<Node, Node> excludedNodes, long blocksize,
+      int maxNodesPerRack,List<DatanodeDescriptor> results
+      ) throws NotEnoughReplicasException {
+    chooseLocalRack(results.get(1), excludedNodes, blocksize, 
+        maxNodesPerRack, results);
   }
     
   /* choose <i>localMachine</i> as the target.
@@ -341,6 +424,10 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
     while(numOfAvailableNodes > 0) {
       DatanodeDescriptor chosenNode = 
         (DatanodeDescriptor)(clusterMap.chooseRandom(nodes));
+      
+      if (chosenNode == null) {
+        break;  // no more node to choose, cluster topology must be changed
+      }
 
       Node oldNode = excludedNodes.put(chosenNode, chosenNode);
       if (oldNode == null) { // choosendNode was not in the excluded list
@@ -415,9 +502,9 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
     }
 
     long remaining = node.getRemaining() - 
-                     (node.getBlocksScheduled() * blockSize); 
+                     (node.getBlocksScheduled() * blockSize);
     // check the remaining capacity of the target machine
-    if (blockSize* FSConstants.MIN_BLOCKS_FOR_WRITE>remaining) {
+    if (blockSize* this.minBlocksToWrite>remaining) {
       if (logr.isDebugEnabled()) {
         logr.debug("Node "+ NodeBase.getPath(node) +
                 " is not chosen because the node does not have enough space" +
@@ -461,46 +548,11 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
       }
       return false;
     }
-    return true;
-  }
-    
-  /* Return a pipeline of nodes.
-   * The pipeline is formed finding a shortest path that 
-   * starts from the writer and traverses all <i>nodes</i>
-   * This is basically a traveling salesman problem.
-   */
-  protected DatanodeDescriptor[] getPipeline(
-                                           DatanodeDescriptor writer,
-                                           DatanodeDescriptor[] nodes) {
-    if (nodes.length==0) return nodes;
-      
-    synchronized(clusterMap) {
-      int index=0;
-      if (writer == null || !clusterMap.contains(writer)) {
-        writer = nodes[0];
-      }
-      for(;index<nodes.length; index++) {
-        DatanodeDescriptor shortestNode = nodes[index];
-        int shortestDistance = clusterMap.getDistance(writer, shortestNode);
-        int shortestIndex = index;
-        for(int i=index+1; i<nodes.length; i++) {
-          DatanodeDescriptor currentNode = nodes[i];
-          int currentDistance = clusterMap.getDistance(writer, currentNode);
-          if (shortestDistance>currentDistance) {
-            shortestDistance = currentDistance;
-            shortestNode = currentNode;
-            shortestIndex = i;
-          }
-        }
-        //switch position index & shortestIndex
-        if (index != shortestIndex) {
-          nodes[shortestIndex] = nodes[index];
-          nodes[index] = shortestNode;
-        }
-        writer = shortestNode;
-      }
+    if (DatanodeInfo.shouldSuspectNodes() && node.isSuspectFail()) {
+      return false;
     }
-    return nodes;
+    
+    return true;
   }
 
   /** {@inheritDoc} */
@@ -522,7 +574,14 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
     return minRacks - racks.size();
   }
 
-  /** {@inheritDoc} */
+  /**
+   * The algorithm is first to pick a node with least free space from nodes
+   * that are on a rack holding more than one replicas of the block.
+   * So removing such a replica won't remove a rack.
+   * If no such a node is available,
+   * then pick a node with least free space
+   * {@inheritDoc}
+   */
   public DatanodeDescriptor chooseReplicaToDelete(FSInodeInfo inode,
                                                  Block block,
                                                  short replicationFactor,

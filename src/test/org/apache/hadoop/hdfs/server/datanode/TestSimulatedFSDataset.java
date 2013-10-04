@@ -63,44 +63,25 @@ public class TestSimulatedFSDataset extends TestCase {
     int bytesAdded = 0;
     for (int i = startingBlockId; i < startingBlockId+NUMBLOCKS; ++i) {
       Block b = new Block(i, 0, 0); // we pass expected len as zero, - fsdataset should use the sizeof actual data written
-      OutputStream dataOut  = fsdataset.writeToBlock(0, b, false, false).dataOut;
-      assertEquals(0, fsdataset.getLength(0,b));
+      BlockDataFile.Writer dataOut = ((SimulatedFSDataset.SimulatedBlockInlineChecksumFileWriter) fsdataset
+          .writeToBlock(0, b, b, false, false, -1, -1)).getBlockDataFile()
+          .getWriter(0);
+      assertEquals(0, fsdataset.getFinalizedBlockLength(0,b));
       for (int j=1; j <= blockIdToLen(i); ++j) {
-        dataOut.write(j);
-        assertEquals(j, fsdataset.getLength(0,b)); // correct length even as we write
+        dataOut.write(new byte[] {(byte)j});
+        assertEquals(j, fsdataset.getFinalizedBlockLength(0,b)); // correct length even as we write
         bytesAdded++;
       }
       dataOut.close();
       b.setNumBytes(blockIdToLen(i));
       fsdataset.finalizeBlock(0,b);
-      assertEquals(blockIdToLen(i), fsdataset.getLength(0,b));
+      assertEquals(blockIdToLen(i), fsdataset.getFinalizedBlockLength(0,b));
     }
     return bytesAdded;  
   }
   int addSomeBlocks(FSDatasetInterface fsdataset ) throws IOException {
     return addSomeBlocks(fsdataset, 1);
   }
-
-  public void testGetMetaData() throws IOException {
-    FSDatasetInterface fsdataset = new SimulatedFSDataset(conf); 
-    Block b = new Block(1, 5, 0);
-    try {
-      assertFalse(fsdataset.metaFileExists(0,b));
-      assertTrue("Expected an IO exception", false);
-    } catch (IOException e) {
-      // ok - as expected
-    }
-    addSomeBlocks(fsdataset); // Only need to add one but ....
-    b = new Block(1, 0, 0);
-    InputStream metaInput = fsdataset.getMetaDataInputStream(0,b);
-    DataInputStream metaDataInput = new DataInputStream(metaInput);
-    short version = metaDataInput.readShort();
-    assertEquals(FSDataset.METADATA_VERSION, version);
-    DataChecksum checksum = DataChecksum.newDataChecksum(metaDataInput);
-    assertEquals(DataChecksum.CHECKSUM_NULL, checksum.getChecksumType());
-    assertEquals(0, checksum.getChecksumSize());  
-  }
-
 
   public void testStorageUsage() throws IOException {
     FSDatasetInterface fsdataset = new SimulatedFSDataset(conf); 
@@ -116,10 +97,15 @@ public class TestSimulatedFSDataset extends TestCase {
 
   void  checkBlockDataAndSize(FSDatasetInterface fsdataset, 
               Block b, long expectedLen) throws IOException { 
-    InputStream input = fsdataset.getBlockInputStream(0,b);
+    ReplicaToRead replica = fsdataset.getReplicaToRead(0, b);
+    InputStream input = replica.getBlockInputStream(null, 0);
     long lengthRead = 0;
     int data;
+    int count = 0;
     while ((data = input.read()) != -1) {
+      if (count++ < BlockInlineChecksumReader.getHeaderSize()) {
+        continue;
+      }
       assertEquals(SimulatedFSDataset.DEFAULT_DATABYTE, data);
       lengthRead++;
     }
@@ -131,8 +117,8 @@ public class TestSimulatedFSDataset extends TestCase {
     addSomeBlocks(fsdataset);
     for (int i=1; i <= NUMBLOCKS; ++i) {
       Block b = new Block(i, 0, 0);
-      assertTrue(fsdataset.isValidBlock(0,b));
-      assertEquals(blockIdToLen(i), fsdataset.getLength(0,b));
+      assertTrue(fsdataset.isValidBlock(0, b, false));
+      assertEquals(blockIdToLen(i), fsdataset.getFinalizedBlockLength(0,b));
       checkBlockDataAndSize(fsdataset, b, blockIdToLen(i));
     }
   }
@@ -174,7 +160,7 @@ public class TestSimulatedFSDataset extends TestCase {
     for (Block b: blockReport) {
       assertNotNull(b);
       assertEquals(blockIdToLen(b.getBlockId()), b.getNumBytes());
-      assertEquals(blockIdToLen(b.getBlockId()), sfsdataset.getLength(0,b));
+      assertEquals(blockIdToLen(b.getBlockId()), sfsdataset.getFinalizedBlockLength(0,b));
     }
     assertEquals(bytesAdded, sfsdataset.getDfsUsed());
     assertEquals(sfsdataset.getCapacity()-bytesAdded, sfsdataset.getRemaining());
@@ -212,7 +198,7 @@ public class TestSimulatedFSDataset extends TestCase {
     for (Block b: blockReport) {
       assertNotNull(b);
       assertEquals(blockIdToLen(b.getBlockId()), b.getNumBytes());
-      assertEquals(blockIdToLen(b.getBlockId()), sfsdataset.getLength(0,b));
+      assertEquals(blockIdToLen(b.getBlockId()), sfsdataset.getFinalizedBlockLength(0,b));
     }
     assertEquals(bytesAdded, sfsdataset.getDfsUsed());
     assertEquals(sfsdataset.getCapacity()-bytesAdded,  sfsdataset.getRemaining());
@@ -234,17 +220,20 @@ public class TestSimulatedFSDataset extends TestCase {
 
   public void checkInvalidBlock(Block b) throws IOException {
     FSDatasetInterface fsdataset = new SimulatedFSDataset(conf); 
-    assertFalse(fsdataset.isValidBlock(0,b));
+    assertFalse(fsdataset.isValidBlock(0, b, false));
     try {
-      fsdataset.getLength(0,b);
+      fsdataset.getFinalizedBlockLength(0,b);
       assertTrue("Expected an IO exception", false);
     } catch (IOException e) {
       // ok - as expected
     }
     
     try {
-      fsdataset.getBlockInputStream(0,b);
-      assertTrue("Expected an IO exception", false);
+      ReplicaToRead replica = fsdataset.getReplicaToRead(0, b);
+      if (replica != null) {
+        InputStream input = replica.getBlockInputStream(null, 0);
+        assertTrue("Expected an IO exception", false);
+      }
     } catch (IOException e) {
       // ok - as expected
     }
@@ -288,7 +277,7 @@ public class TestSimulatedFSDataset extends TestCase {
     // Now make sure the rest of the blocks are valid
     for (int i=3; i <= NUMBLOCKS; ++i) {
       Block b = new Block(i, 0, 0);
-      assertTrue(fsdataset.isValidBlock(0,b));
+      assertTrue(fsdataset.isValidBlock(0, b, false));
     }
   }
 

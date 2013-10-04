@@ -28,11 +28,13 @@ import java.net.URLEncoder;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
+import org.apache.hadoop.hdfs.protocol.FSConstants;
+import org.apache.hadoop.hdfs.server.namenode.NameNode;
 import org.apache.hadoop.hdfs.server.namenode.NamenodeFsck;
 import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
-import org.apache.hadoop.security.SecurityUtil;
+import org.apache.hadoop.hdfs.DFSUtil;
 
 /**
  * This class provides rudimentary checking of DFS volumes for errors and
@@ -56,14 +58,14 @@ import org.apache.hadoop.security.SecurityUtil;
  *  optionally can print detailed statistics on block locations and replication
  *  factors of each file.
  *  The tool also provides and option to filter open files during the scan.
- *  
+ *
  */
 public class DFSck extends Configured implements Tool {
 
   DFSck() {
     this.out = System.out;
   }
-  
+
   private final PrintStream out;
 
   /**
@@ -80,12 +82,12 @@ public class DFSck extends Configured implements Tool {
     this.out = out;
   }
 
-  
-  private String getInfoServer() throws IOException {
-    return NetUtils.getServerAddress(getConf(), "dfs.info.bindAddress", 
+
+  protected String getInfoServer() throws Exception {
+    return NetUtils.getServerAddress(getConf(), "dfs.info.bindAddress",
                                      "dfs.info.port", "dfs.http.address");
   }
-  
+
   /**
    * Print fsck usage information
    */
@@ -93,7 +95,8 @@ public class DFSck extends Configured implements Tool {
     System.err.println("Usage: DFSck <path> [-list-corruptfileblocks | " +
                        "[-move | -delete | -openforwrite ] " +
                        "[-files [-blocks [-locations | -racks]]]] " +
-                       "[-limit <limit>]");
+                       "[-limit <limit>] [-service serviceName]" + 
+                       "[-(zero/one)]");
     System.err.println("\t<path>\tstart checking from this path");
     System.err.println("\t-move\tmove corrupted files to /lost+found");
     System.err.println("\t-delete\tdelete corrupted files");
@@ -152,36 +155,38 @@ public class DFSck extends Configured implements Tool {
             }
             continue;
           }
-          if ((line.endsWith(noCorruptLine)) || 
+          if ((line.endsWith(noCorruptLine)) ||
               (line.endsWith(noMoreCorruptLine)) ||
+              (line.endsWith(NamenodeFsck.HEALTHY_STATUS)) ||
               (line.endsWith(NamenodeFsck.NONEXISTENT_STATUS)) ||
               numCorrupt >= limit) {
             allDone = true;
             break;
           }
           if ((line.isEmpty())
-              || (line.startsWith("FSCK started by")) 
+              || (line.startsWith("FSCK started by"))
+              || (line.startsWith("Unable to locate any corrupt files under"))
               || (line.startsWith("The filesystem under path")))
             continue;
           numCorrupt++;
           if (numCorrupt == 1) {
-            out.println("The list of corrupt files under path '" 
+            out.println("The list of corrupt files under path '"
                         + dir + "' are:");
           }
           out.println(line);
-          try {   
-            // Get the block # that we need to send in next call    
-            lastBlock = line.split("\t")[0];    
-          } catch (Exception e) {   
-            allDone = true;   
-            break;    
+          try {
+            // Get the block # that we need to send in next call
+            lastBlock = line.split("\t")[0];
+          } catch (Exception e) {
+            allDone = true;
+            break;
           }
         }
       } finally {
         input.close();
       }
     }
-    out.println("The filesystem under path '" + dir + "' has " 
+    out.println("The filesystem under path '" + dir + "' has "
                 + numCorrupt + " CORRUPT files");
     if (numCorrupt == 0)
       errCode = 0;
@@ -192,6 +197,13 @@ public class DFSck extends Configured implements Tool {
    * @param args
    */
   public int run(String[] args) throws Exception {
+    try { 
+      args = DFSUtil.setGenericConf(args, getConf()); 
+    } catch (IllegalArgumentException e) {  
+      System.err.println(e.getMessage()); 
+      printUsage(); 
+      return -1; 
+    }
     String fsName = getInfoServer();
     if (args.length == 0) {
       printUsage();
@@ -235,6 +247,7 @@ public class DFSck extends Configured implements Tool {
       return listCorruptFileBlocks(dir, limit, url.toString());
     }
     URL path = new URL(url.toString());
+    System.err.println("Connecting to : " + path);
     URLConnection connection = path.openConnection();
     InputStream stream = connection.getInputStream();
     BufferedReader input = new BufferedReader(new InputStreamReader(
@@ -263,16 +276,79 @@ public class DFSck extends Configured implements Tool {
   static{
     Configuration.addDefaultResource("hdfs-default.xml");
     Configuration.addDefaultResource("hdfs-site.xml");
+    Configuration.addDefaultResource("avatar-default.xml");
+    Configuration.addDefaultResource("avatar-site.xml");
   }
   
+  /**
+   * Adjusts configuration for nameservice keys. Also uses avatar-aware trick,
+   * so we can use fsck without ZK, also during failover, manually by specifying
+   * zero/one option.
+   */
+  private static String[] adjustConf(String[] argv, Configuration conf) {
+    String[] serviceId = new String[] { "" };
+    String[] filteredArgv = DFSUtil.getServiceName(argv, serviceId);
+    
+    if (!serviceId[0].equals("")) {
+      NameNode.checkServiceName(conf, serviceId[0]);
+      DFSUtil.setGenericConf(conf, serviceId[0],
+          NameNode.NAMESERVICE_SPECIFIC_KEYS);
+      NameNode.setupDefaultURI(conf);
+    }
+    
+    // make it avatar aware (manual option)
+    if (optionExist(argv, "-one")) {
+      updateConfKeys(conf, "1", serviceId[0]);
+    } else {
+      updateConfKeys(conf, "0", serviceId[0]);
+    }
+    return filteredArgv;
+  }
+
   public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    
+    // service aware
+    try {
+      args = adjustConf(args, conf);
+    } catch (IllegalArgumentException e) {
+      System.err.println(e.getMessage());
+      printUsage();
+      System.exit(-1);
+    }
+    
     // -files option is also used by GenericOptionsParser
     // Make sure that is not the first argument for fsck
     int res = -1;
-    if ((args.length == 0 ) || ("-files".equals(args[0]))) 
+    if ((args.length == 0 ) || ("-files".equals(args[0])))
       printUsage();
     else
-      res = ToolRunner.run(new DFSck(new Configuration()), args);
+      res = ToolRunner.run(new DFSck(conf), args);
     System.exit(res);
+  }
+  
+ 
+  /**
+   * For federated and avatar clusters, we need update the http key.
+   */
+  private static void updateConfKeys(Configuration conf, String suffix,
+      String nameserviceId) {
+    String value = conf.get(FSConstants.DFS_NAMENODE_HTTP_ADDRESS_KEY + suffix
+        + (nameserviceId.isEmpty() ? "" : ("." + nameserviceId)));
+    if (value != null) {
+      conf.set(FSConstants.DFS_NAMENODE_HTTP_ADDRESS_KEY, value);
+    }
+  }
+  
+  /**
+   * Check if the option exist in the given arguments.
+   */
+  private static boolean optionExist(String args[], String opt) {
+    for (String arg : args) {
+      if (arg.equalsIgnoreCase(opt)) {
+        return true;
+      }
+    }
+    return false;
   }
 }

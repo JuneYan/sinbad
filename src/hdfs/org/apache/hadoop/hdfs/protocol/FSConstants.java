@@ -18,6 +18,7 @@
 package org.apache.hadoop.hdfs.protocol;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.util.DataChecksum;
 
 /************************************
  * Some handy constants
@@ -27,7 +28,7 @@ public interface FSConstants {
   public static int MIN_BLOCKS_FOR_WRITE = 5;
 
   // Chunk the block Invalidate message
-  public static final int BLOCK_INVALIDATE_CHUNK = 1000;
+  public static final int BLOCK_INVALIDATE_CHUNK = 100;
 
   // Long that indicates "leave current quota unchanged"
   public static final long QUOTA_DONT_SET = Long.MAX_VALUE;
@@ -61,10 +62,19 @@ public interface FSConstants {
   public static final int SIZE_OF_INTEGER = Integer.SIZE / Byte.SIZE;
 
   // SafeMode actions
-  public enum SafeModeAction{ SAFEMODE_LEAVE, SAFEMODE_ENTER, SAFEMODE_GET; }
+  public enum SafeModeAction {
+    SAFEMODE_LEAVE, 
+    SAFEMODE_ENTER, 
+    SAFEMODE_GET, 
+    SAFEMODE_INITQUEUES, 
+    SAFEMODE_PREP_FAILOVER;
+  }
 
   // type of the datanode report
   public static enum DatanodeReportType {ALL, LIVE, DEAD }
+  
+  public static int CHECKSUM_TYPE = DataChecksum.CHECKSUM_CRC32;
+  public static int DEFAULT_BYTES_PER_CHECKSUM = 512;
 
   /**
    * Distributed upgrade actions:
@@ -82,13 +92,23 @@ public interface FSConstants {
   // The RBW layout version which has the rbw dir under current/
   public static final int RBW_LAYOUT_VERSION = -34;
 
+  // The layout version for the FSImage format in which we store the last edit
+  // written to the FSImage alongwith the FSImage.
+  public static final int STORED_TXIDS= -37;
+
   // Version is reflected in the dfs image and edit log files.
   // Version is reflected in the data storage file.
   // Versions are negative.
   // Decrement LAYOUT_VERSION to define a new version.
-  public static final int LAYOUT_VERSION = -35;
+  public static final int LAYOUT_VERSION = -44;
   // Current version: 
-  // -35: federation version
+  // -40: All the INodeFiles will have a INode type (1 byte) and 
+  // only the hardlink files will persist an additional hardlink ID (1 vLong)
+  // right after the the Inode type.
+  // -41: support inline checksum.
+  // -42: add unique id for each inode
+  // -43: add block checksum in BlockInfo
+  // -44: support raid
   public static final int FEDERATION_VERSION = -35;
   
   public static final String DFS_SOFT_LEASE_KEY = "dfs.softlease.period";
@@ -102,15 +122,49 @@ public interface FSConstants {
   public static final String DFS_FEDERATION_NAMESERVICES = "dfs.federation.nameservices";
   public static final String DFS_FEDERATION_NAMESERVICE_ID = "dfs.federation.nameservice.id";
   
+  public static final String DFS_BLK_RECOVERY_BY_NN_TIMEOUT_KEY = "dfs.datanode.blockrecovery.bynamenode.timeout";
+  public static final long DFS_BLK_RECOVERY_BY_NN_TIMEOUT_DEFAULT = 275000;
+  
+  public static final String DFS_DATANODE_ADDRESS_KEY = "dfs.datanode.address";
+  public static final String DFS_DATANODE_IPC_ADDRESS_KEY = "dfs.datanode.ipc.address";
+  public static final String DFS_DATANODE_HTTP_ADDRESS_KEY = "dfs.datanode.http.address";
+
   public static final String  DFS_NAMENODE_RPC_ADDRESS_KEY = "dfs.namenode.rpc-address";
   public static final String  DFS_NAMENODE_HTTP_ADDRESS_KEY = "dfs.http.address";
   public static final String  DFS_NAMENODE_SECONDARY_HTTP_ADDRESS_KEY = "dfs.secondary.http.address";
+  public static final String  DFS_RAIDNODE_HTTP_ADDRESS_KEY = "dfs.raid.http.address";
 
+  public static final String  FS_OUTPUT_STREAM_AUTO_PRINT_PROFILE = "dfs.write.profile.auto.print";
+  
+  public static final String DFS_NAMENODE_NAME_DIR_WILDCARD = "avatar_instance";
   public static final String DFS_NAMENODE_NAME_DIR_KEY = "dfs.name.dir";
   public static final String DFS_NAMENODE_EDITS_DIR_KEY = "dfs.name.edits.dir";
   public static final String DFS_NAMENODE_CHECKPOINT_DIR_KEY = "fs.checkpoint.dir";
   public static final String DFS_NAMENODE_CHECKPOINT_EDITS_DIR_KEY = "fs.checkpoint.edits.dir";
 
+  public static final String DFS_USE_INLINE_CHECKSUM_KEY = "dfs.use.inline.checksum";
+
+  
+  public static String DFS_NAMENODE_NUM_CHECKPOINTS_RETAINED_KEY = "dfs.num.checkpoints.retained";
+
   public static final long MIN_INTERVAL_CHECK_DIR_MSEC = 300 * 1000;
 
+  public static String FS_NAMENODE_ALIASES = "fs.default.name.aliases";
+  public static String DFS_NAMENODE_DN_ALIASES = "dfs.namenode.dn-address.aliases";
+  public static String DFS_HTTP_ALIASES = "dfs.http.address.aliases";
+
+  public static final String DFS_HOSTS = "dfs.hosts";
+
+  public static final String DFS_NAMENODE_DNS_INTERFACE = "dfs.namenode.dns.interface";
+  public static final String DFS_DATANODE_DNS_INTERFACE = "dfs.datanode.dns.interface";
+  
+  public static final String FS_HA_ZOOKEEPER_QUORUM = "fs.ha.zookeeper.quorum";
+  public static final String DEAD_DATANODE_URL = "dfs.dead.datanode.url";
+  
+  public static final String DFS_CLUSTER_NAME = "dfs.cluster.name";
+  public static final String DFS_CLUSTER_ID = "dfs.cluster.id";
+
+  public static final String CLIENT_CONFIGURATION_LOOKUP_DONE          = "client.configuration.lookup.done";
+  public static final String SLAVE_HOST_NAME = "slave.host.name";
+  public static String DFS_CLIENT_NAMENODE_SOCKET_TIMEOUT = "dfs.client.namenode.ipc.socket.timeout";
 }

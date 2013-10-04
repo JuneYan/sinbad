@@ -20,37 +20,40 @@ package org.apache.hadoop.hdfs.server.namenode;
 import java.io.FileNotFoundException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
+import java.util.Set;
 
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.fs.permission.PermissionStatus;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.protocol.Block;
+import org.apache.hadoop.hdfs.server.namenode.BlocksMap.BlockInfo;
 
 /**
  * Directory INode class.
  */
 class INodeDirectory extends INode {
   protected static final int DEFAULT_FILES_PER_DIRECTORY = 5;
+  protected static final int UNKNOWN_INDEX = -1;
   final static String ROOT_NAME = "";
 
   private List<INode> children;
 
-  INodeDirectory(String name, PermissionStatus permissions) {
-    super(name, permissions);
+  INodeDirectory(long id, String name, PermissionStatus permissions) {
+    super(id, name, permissions);
     this.children = null;
   }
 
-  public INodeDirectory(PermissionStatus permissions, long mTime) {
-    super(permissions, mTime, 0);
+  public INodeDirectory(long id, PermissionStatus permissions, long mTime) {
+    super(id, permissions, mTime, 0);
     this.children = null;
   }
 
   /** constructor */
-  INodeDirectory(byte[] localName, PermissionStatus permissions, long mTime) {
-    this(permissions, mTime);
+  INodeDirectory(long id, byte[] localName, PermissionStatus permissions, long mTime) {
+    this(id, permissions, mTime);
     this.name = localName;
   }
   
@@ -66,8 +69,13 @@ class INodeDirectory extends INode {
   /**
    * Check whether it's a directory
    */
+  @Override
   public boolean isDirectory() {
     return true;
+  }
+  
+  public void setChildrenCapacity(int size){  
+    this.children = new ArrayList<INode>(size); 
   }
 
   INode removeChild(INode node) {
@@ -79,8 +87,10 @@ class INodeDirectory extends INode {
       return null;
     }
   }
-
-  /** Replace a child that has the same name as newChild by newChild.
+  
+  /** 
+   * Replace a child that has the same name as newChild by newChild. This is only working on one
+   * child case
    * 
    * @param newChild Child node to be added
    */
@@ -88,14 +98,32 @@ class INodeDirectory extends INode {
     if ( children == null ) {
       throw new IllegalArgumentException("The directory is empty");
     }
+    
     int low = Collections.binarySearch(children, newChild.name);
     if (low>=0) { // an old child exists so replace by the newChild
+      INode oldChild = children.get(low);
+      
+      // Need to make sure we are replacing the oldChild with newChild that is the same as oldChild
+      // which means they reference to the same children or they are null or empty array
       children.set(low, newChild);
+      
+      // newChild should point to current instance (parent of oldChild)
+      newChild.parent = this;
+      
+      // if both are directory, all the children from oldChild should point to newChild
+      if (newChild.isDirectory() && oldChild.isDirectory()) {
+        if (((INodeDirectory)oldChild).getChildren() != null) {
+          for (INode oldGrandChild : ((INodeDirectory)oldChild).getChildren()) {
+            oldGrandChild.parent = (INodeDirectory)newChild;
+          }
+        }
+      }
+      
     } else {
       throw new IllegalArgumentException("No child exists to be replaced");
     }
   }
-  
+
   INode getChild(String name) {
     return getChildINode(DFSUtil.string2Bytes(name));
   }
@@ -113,7 +141,7 @@ class INodeDirectory extends INode {
 
   /**
    */
-  private INode getNode(byte[][] components) {
+  INode getNode(byte[][] components) {
     INode[] inode  = new INode[1];
     getExistingPathINodes(components, inode);
     return inode[0];
@@ -123,6 +151,10 @@ class INodeDirectory extends INode {
    * This is the external interface
    */
   INode getNode(String path) {
+    return getNode(getPathComponents(path));
+  }
+  
+  INode getNode(byte[] path) {
     return getNode(getPathComponents(path));
   }
 
@@ -161,7 +193,7 @@ class INodeDirectory extends INode {
    * @return number of existing INodes in the path
    */
   int getExistingPathINodes(byte[][] components, INode[] existing) {
-    assert compareBytes(this.name, components[0]) == 0 :
+    assert compareTo(components[0]) == 0 :
       "Incorrect name " + getLocalName() + " expected " + components[0];
 
     INode curNode = this;
@@ -195,7 +227,7 @@ class INodeDirectory extends INode {
    *         
    * @see #getExistingPathINodes(byte[][], INode[])
    */
-  INode[] getExistingPathINodes(String path) {
+  public INode[] getExistingPathINodes(String path) {
     byte[][] components = getPathComponents(path);
     INode[] inodes = new INode[components.length];
 
@@ -213,7 +245,7 @@ class INodeDirectory extends INode {
    *          node, otherwise
    */
   <T extends INode> T addChild(final T node, boolean inheritPermission) {
-    return addChild(node, inheritPermission, true);
+    return addChild(node, inheritPermission, true, UNKNOWN_INDEX);
   }
   /**
    * Add a child inode to the directory.
@@ -221,11 +253,13 @@ class INodeDirectory extends INode {
    * @param node INode to insert
    * @param inheritPermission inherit permission from parent?
    * @param propagateModTime set parent's mod time to that of a child?
+   * @param childIndex index of the inserted child if known
    * @return  null if the child with this name already exists; 
    *          node, otherwise
    */
   <T extends INode> T addChild(final T node, boolean inheritPermission,
-                                              boolean propagateModTime) {
+                                              boolean propagateModTime,
+                                              int childIndex) {
     if (inheritPermission) {
       FsPermission p = getFsPermission();
       //make sure the  permission has wx for the user
@@ -239,18 +273,29 @@ class INodeDirectory extends INode {
     if (children == null) {
       children = new ArrayList<INode>(DEFAULT_FILES_PER_DIRECTORY);
     }
-    int low = Collections.binarySearch(children, node.name);
-    if(low >= 0)
-      return null;
+    int index;  
+    if (childIndex >= 0) {
+      index = childIndex; 
+    } else {
+      int low = Collections.binarySearch(children, node.name);
+      if(low >= 0)
+        return null;
+      index = -low - 1;
+    }
     node.parent = this;
-    children.add(-low - 1, node);
+    children.add(index, node);
     if (propagateModTime) {
       // update modification time of the parent directory
       setModificationTime(node.getModificationTime());      
     }
-    if (node.getGroupName() == null) {
-      node.setGroup(getGroupName());
-    }
+    if (childIndex < 0) {
+      // if child Index is provided (>=0), this is a result of 
+      // loading the image, and the group name is set, no need
+      // to check
+      if (node.getGroupName() == null) {
+        node.setGroup(getGroupName());
+      }
+    } 
     return node;
   }
 
@@ -315,11 +360,12 @@ class INodeDirectory extends INode {
                              INode newNode,
                              INodeDirectory parent,
                              boolean inheritPermission,
-                             boolean propagateModTime
+                             boolean propagateModTime,
+                             int childIndex
                             ) throws FileNotFoundException {
     // insert into the parent children list
     newNode.name = localname;
-    if(parent.addChild(newNode, inheritPermission, propagateModTime) == null)
+    if(parent.addChild(newNode, inheritPermission, propagateModTime, childIndex) == null)
       return null;
     return parent;
   }
@@ -357,31 +403,90 @@ class INodeDirectory extends INode {
     newNode.name = pathComponents[pathLen-1];
     // insert into the parent children list
     INodeDirectory parent = getParent(pathComponents);
-    if(parent.addChild(newNode, inheritPermission, propagateModTime) == null)
+    if(parent.addChild(newNode, inheritPermission, propagateModTime, UNKNOWN_INDEX) == null)
       return null;
     return parent;
   }
 
   /** {@inheritDoc} */
+  @Override
   DirCounts spaceConsumedInTree(DirCounts counts) {
+    Set<Long> visitedCtx = new HashSet<Long>(); 
+    return spaceConsumedInTree(counts, visitedCtx);
+  }
+  
+  DirCounts spaceConsumedInTree(DirCounts counts, Set<Long> visitedCtx) {
     counts.nsCount += 1;
     if (children != null) {
       for (INode child : children) {
-        child.spaceConsumedInTree(counts);
+        if (child.isDirectory()) {
+          // Process the directory with the visited hard link context
+          ((INodeDirectory) child).spaceConsumedInTree(counts, visitedCtx);
+        } else {
+          // Process the file
+          if (child instanceof INodeHardLinkFile) {
+            // Get the current hard link ID
+            long hardLinkID = ((INodeHardLinkFile) child).getHardLinkID();
+
+            if (visitedCtx.contains(hardLinkID)) {
+              // The current hard link file has been visited, so skip processing
+              // But update the nsCount
+              counts.nsCount++;
+              continue;
+            } else {
+              // Add the current hard link file to the visited set
+              visitedCtx.add(hardLinkID);
+            }
+          }
+          // compute the current child
+          child.spaceConsumedInTree(counts);
+        }
       }
     }
-    return counts;    
+    return counts;
   }
 
-  /** {@inheritDoc} */
-  long[] computeContentSummary(long[] summary) {
-    if (children != null) {
+  /** {@inheritDoc} */  
+  @Override
+  long[] computeContentSummary(long[] summary) {  
+    Set<Long> visitedCtx = new HashSet<Long>(); 
+    return this.computeContentSummary(summary, visitedCtx); 
+  } 
+    
+  /** 
+   * Compute the content summary and skip calculating the visited hard link file. 
+   */ 
+  private long[] computeContentSummary(long[] summary, Set<Long> visitedCtx) {  
+    if (children != null) { 
       for (INode child : children) {
-        child.computeContentSummary(summary);
-      }
-    }
-    summary[2]++;
-    return summary;
+        if (child.isDirectory()) {
+          // Process the directory with the visited hard link context 
+          ((INodeDirectory)child).computeContentSummary(summary, visitedCtx); 
+        } else {  
+          // Process the file 
+          if (child instanceof INodeHardLinkFile) {
+            // Get the current hard link ID 
+            long hardLinkID = ((INodeHardLinkFile) child).getHardLinkID();  
+            if (visitedCtx.contains(hardLinkID)) {
+              // The current hard link file has been visited, so only increase the file count.
+              summary[1] ++;
+              continue; 
+            } else {
+              // Add the current hard link file to the visited set  
+              visitedCtx.add(hardLinkID);
+              // Compute the current hardlink file  
+              child.computeContentSummary(summary); 
+            } 
+          } else {
+            // compute the current child for non hard linked files
+            child.computeContentSummary(summary); 
+          }
+
+        } 
+      } 
+    } 
+    summary[2]++; 
+    return summary; 
   }
 
   /**
@@ -389,21 +494,53 @@ class INodeDirectory extends INode {
   List<INode> getChildren() {
     return children==null ? new ArrayList<INode>() : children;
   }
+  
   List<INode> getChildrenRaw() {
     return children;
   }
 
-  int collectSubtreeBlocksAndClear(List<Block> v) {
-    int total = 1;
+  private static boolean isBlocksLimitReached(List<BlockInfo> v, int blocksLimit) {
+    return blocksLimit != FSDirectory.BLOCK_DELETION_NO_LIMIT
+        && blocksLimit <= v.size();
+  }
+  
+  @Override
+  int collectSubtreeBlocksAndClear(List<BlockInfo> v, 
+                                   int blocksLimit, 
+                                   List<INode> removedINodes) {
+    if (isBlocksLimitReached(v, blocksLimit)) {
+      return 0;
+    }
+    int total = 0;
     if (children == null) {
+      parent = null;
+      name = null;
+      removedINodes.add(this);
+      return ++total;
+    }
+    int i;
+    for (i=0; i<children.size(); i++) {
+      INode child = children.get(i);
+      total += child.collectSubtreeBlocksAndClear(v, blocksLimit, removedINodes);
+      if (isBlocksLimitReached(v, blocksLimit)) {
+        // reached blocks limit
+        if (child.parent != null) {
+          i--; // this child has not finished yet
+        }
+        break;
+      }
+    }
+    if (i<children.size()-1) { // partial children are processed
+      // Remove children [0,i]
+      children = children.subList(i+1, children.size());
       return total;
     }
-    for (INode child : children) {
-      total += child.collectSubtreeBlocksAndClear(v);
-    }
+    // all the children are processed
     parent = null;
+    name = null;
     children = null;
-    return total;
+    removedINodes.add(this);
+    return ++total;
   }
   
   /**

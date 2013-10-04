@@ -25,6 +25,7 @@ import java.net.*;
 import java.util.List;
 
 import org.apache.hadoop.hdfs.DFSClient;
+import org.apache.hadoop.hdfs.DFSInputStream;
 import org.apache.hadoop.hdfs.HftpFileSystem;
 import org.apache.hadoop.hdfs.protocol.DatanodeID;
 import org.apache.hadoop.hdfs.server.datanode.DataNode;
@@ -34,7 +35,6 @@ import org.apache.hadoop.conf.*;
 
 public class StreamFile extends DfsServlet {
   private static final Configuration masterConf = new Configuration();
-  static DataNode datanode = DataNode.getDataNode();
   
   /** getting a client for connecting to dfs */
   protected DFSClient getDFSClient(HttpServletRequest request)
@@ -93,7 +93,7 @@ public class StreamFile extends DfsServlet {
       return;
     }
     DFSClient dfs = null;
-    DFSClient.DFSInputStream in = null;
+    DFSInputStream in = null;
     OutputStream os = null;
     try {
       dfs = getDFSClient(request);

@@ -41,7 +41,12 @@
 #   HADOOP_ROOT_LOGGER The root appender. Default is INFO,console
 #
 
-bin=`dirname "$0"`
+thisfile="${BASH_SOURCE[0]}"
+if [ -L "${thisfile}" ]; then
+  thisfile=$(readlink "${thisfile}")
+fi
+
+bin=`dirname "${thisfile}"`
 bin=`cd "$bin"; pwd`
 
 . "$bin"/hadoop-config.sh
@@ -61,14 +66,18 @@ if [ $# = 0 ]; then
   echo "  datanode             run a DFS datanode"
   echo "  dfsadmin             run a DFS admin client"
   echo "  mradmin              run a Map-Reduce admin client"
+  echo "  coronaadmin          run a Corona admin client"
   echo "  fsck                 run a DFS filesystem checking utility"
+  echo "  avatarfsck           run a avatar DFS filesystem checking utility"
   echo "  raidfsck [path]      run RAID-aware filesystem checking utility"
   echo "  raidshell [options]  run RAID-shell utility"
   echo "  fs                   run a generic filesystem user client"
   echo "  balancer             run a cluster balancing utility"
+  echo "  avatarbalancer       run a avatar cluster balancing utility"
   echo "  jmxget               get JMX exported values from NameNode or DataNode."
   echo "  oiv                  apply the offline fsimage viewer to an fsimage"
   echo "  oev                  apply the offline edits viewer to an edits file"
+  echo "  oid                  apply the offline fsimage decompressor to an fsimage"
   echo "                       Use -help to see options"
   echo "  jobtracker           run the MapReduce job Tracker node"
   echo "  pipes                run a Pipes job"
@@ -77,6 +86,7 @@ if [ $# = 0 ]; then
   echo "  queue                get information regarding JobQueues"
   echo "  version              print the version"
   echo "  jar <jar>            run a jar file"
+  echo "  onejar <jar>         run a jar file packaged using one-jar, do not specify name of main class"
   echo "  distcp <srcurl> <desturl> copy file or directories recursively"
   echo "  fastcopy <src file> <dest file> copy files by maintaining optimal locality"
   echo "  archive -archiveName NAME -p <parent path> <src>* <dest> create a hadoop archive"
@@ -120,6 +130,7 @@ fi
 # CLASSPATH initially contains $HADOOP_CONF_DIR
 JMX_OPTS=""
 CLASSPATH="${HADOOP_CONF_DIR}"
+CLASSPATH=${CLASSPATH}:$HADOOP_CLASSPATH
 CLASSPATH=${CLASSPATH}:$JAVA_HOME/lib/tools.jar
 
 # for developers, add Hadoop classes to CLASSPATH
@@ -151,18 +162,64 @@ for f in $HADOOP_HOME/hadoop-*-core.jar; do
 done
 
 # add libs to CLASSPATH
-for f in $HADOOP_HOME/lib/*.jar; do
-  CLASSPATH=${CLASSPATH}:$f;
-done
-
-for f in $HADOOP_HOME/lib/logger/*.jar; do
-  CLASSPATH=${CLASSPATH}:$f;
-done
+# the thrift library has conflicts in hdfs-nfs-proxy
+# only put neccessary jars for hdfs-nfs-proxy
+if [ "$COMMAND" = "hdfsnfsproxy" ] ; then
+  for f in $HADOOP_HOME/lib/slf4j*.jar; do
+    CLASSPATH=${CLASSPATH}:$f;
+  done
+  for f in $HADOOP_HOME/lib/zookeeper*.jar; do
+    CLASSPATH=${CLASSPATH}:$f;
+  done
+  for f in $HADOOP_HOME/lib/guava*.jar; do
+    CLASSPATH=${CLASSPATH}:$f;
+  done
+  for f in $HADOOP_HOME/lib/json*.jar; do
+    CLASSPATH=${CLASSPATH}:$f;
+  done
+  for f in $HADOOP_HOME/lib/commons*.jar; do
+    CLASSPATH=${CLASSPATH}:$f;
+  done
+  for f in $HADOOP_HOME/lib/log4j*.jar; do
+    CLASSPATH=${CLASSPATH}:$f;
+  done
+  for f in $HADOOP_HOME/lib/hadoop*.jar; do
+    CLASSPATH=${CLASSPATH}:$f;
+  done
+else
+  for f in $HADOOP_HOME/lib/*.jar; do
+    CLASSPATH=${CLASSPATH}:$f;
+  done
+fi
 
 if [ -d "$HADOOP_HOME/build/ivy/lib/Hadoop/common" ]; then
-for f in $HADOOP_HOME/build/ivy/lib/Hadoop/common/*.jar; do
-  CLASSPATH=${CLASSPATH}:$f;
-done
+  if [ "$COMMAND" = "hdfsnfsproxy" ] ; then
+    for f in $HADOOP_HOME/build/ivy/lib/Hadoop/common/slf4j*.jar; do
+      CLASSPATH=${CLASSPATH}:$f;
+    done
+    for f in $HADOOP_HOME/build/ivy/lib/Hadoop/common/zookeeper*.jar; do
+      CLASSPATH=${CLASSPATH}:$f;
+    done
+    for f in $HADOOP_HOME/build/ivy/lib/Hadoop/common/guava*.jar; do
+      CLASSPATH=${CLASSPATH}:$f;
+    done
+    for f in $HADOOP_HOME/build/ivy/lib/Hadoop/common/json*.jar; do
+      CLASSPATH=${CLASSPATH}:$f;
+    done
+    for f in $HADOOP_HOME/build/ivy/lib/Hadoop/common/commons*.jar; do
+      CLASSPATH=${CLASSPATH}:$f;
+    done
+    for f in $HADOOP_HOME/build/ivy/lib/Hadoop/common/log4j*.jar; do
+      CLASSPATH=${CLASSPATH}:$f;
+    done
+    for f in $HADOOP_HOME/build/ivy/lib/Hadoop/common/hadoop*.jar; do
+      CLASSPATH=${CLASSPATH}:$f;
+    done
+  else
+   for f in $HADOOP_HOME/build/ivy/lib/Hadoop/common/*.jar; do
+      CLASSPATH=${CLASSPATH}:$f;
+   done
+  fi
 fi
 
 for f in $HADOOP_HOME/lib/jsp-2.1/*.jar; do
@@ -176,12 +233,6 @@ for f in $HADOOP_HOME/build/hadoop-*-tools.jar; do
   TOOL_PATH=${TOOL_PATH}:$f;
 done
 
-# add user-specified CLASSPATH before corona so that a newer
-# corona jar can be specified to override the deployed one
-if [ "$HADOOP_CLASSPATH" != "" ]; then
-  CLASSPATH=${CLASSPATH}:${HADOOP_CLASSPATH}
-fi
-
 # CORONA_PATH for corona daemons
 if [ -d "$HADOOP_HOME/build/contrib/corona/classes" ]; then
   CORONA_PATH=${CORONA_PATH}:$HADOOP_HOME/build/contrib/corona/classes
@@ -191,12 +242,54 @@ for f in $HADOOP_HOME/contrib/corona/*.jar; do
   CORONA_PATH=${CORONA_PATH}:$f;
 done
 
-if [ "$CORONA_PATH" != "" ]; then
-  CLASSPATH=${CLASSPATH}:${CORONA_PATH}
+if [ "$COMMAND" != "hdfsnfsproxy" ] ; then
+  if [ "$CORONA_PATH" != "" ]; then
+    CLASSPATH=${CLASSPATH}:${CORONA_PATH}
+  fi
 fi
 
 for f in $HADOOP_HOME/contrib/corona/lib/*.jar; do
   CORONA_LIB_PATH=${CORONA_LIB_PATH}:$f;
+done
+
+# NOTIFIER_PATH for the namespace notifier server daemon
+if [ -d "$HADOOP_HOME/build/contrib/namespace-notifier/classes" ]; then
+  NOTIFIER_PATH=${NOTIFIER_PATH}:$HADOOP_HOME/build/contrib/namespace-notifier/classes
+fi
+
+for f in $HADOOP_HOME/contrib/namespace-notifier/*.jar; do
+  NOTIFIER_PATH=${NOTIFIER_PATH}:$f;
+done
+
+# NFS_PROXY_PATH for the hdfs nfs proxy daemon
+if [ -d "$HADOOP_HOME/build/contrib/hdfs-nfs-proxy/classes" ] ; then
+  NFS_PROXY_PATH=${NFS_PROXY_PATH}:$HADOOP_HOME/build/contrib/hdfs-nfs-proxy/classes
+fi
+
+# hdfs-nfs-proxy needs raid and configerator in classpath
+# to get DistributedRaidFileSystem from configuration
+if [ -d "$HADOOP_HOME/build/contrib/raid/classes" ] ; then
+    NFS_PROXY_PATH=${NFS_PROXY_PATH}:$HADOOP_HOME/build/contrib/raid/classes
+fi
+
+if [ -d "$HADOOP_HOME/build/contrib/configerator/classes" ] ; then
+    NFS_PROXY_PATH=${NFS_PROXY_PATH}:$HADOOP_HOME/build/contrib/configerator/classes
+fi
+
+for f in $HADOOP_HOME/build/contrib/hdfs-nfs-proxy/lib/*.jar; do
+  NFS_PROXY_PATH=${NFS_PROXY_PATH}:$f;
+done
+
+for f in $HADOOP_HOME/build/contrib/hdfs-nfs-proxy/hadoop-*-hdfs-nfs-proxy.jar; do
+  NFS_PROXY_PATH=${NFS_PROXY_PATH}:$f;
+done
+
+for f in $HADOOP_HOME/contrib/hdfs-nfs-proxy/*.jar; do
+  NFS_PROXY_PATH=${NFS_PROXY_PATH}:$f;
+done
+
+for f in $HADOOP_HOME/contrib/hdfs-nfs-proxy/lib/*.jar; do
+  NFS_PROXY_PATH=${NFS_PROXY_PATH}:$f;
 done
 
 # default log directory & file
@@ -229,17 +322,62 @@ if [ "$COMMAND" = "namenode" ] ; then
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_GC_LOG_OPTS $HADOOP_NAMENODE_OPTS"
 elif [ "$COMMAND" = "avatarshell" ] ; then
   CLASS='org.apache.hadoop.hdfs.AvatarShell'
+  HADOOP_LOGFILE='avatarshell.log'
+  HADOOP_ROOT_LOGGER=INFO,DRFA
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_GC_LOG_OPTS $HADOOP_CLIENT_OPTS"
 elif [ "$COMMAND" = "avatarzk" ] ; then
   CLASS='org.apache.hadoop.hdfs.AvatarZKShell'
+  HADOOP_LOGFILE='avatarzkshell.log'
+  HADOOP_ROOT_LOGGER=INFO,DRFA
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_GC_LOG_OPTS $HADOOP_CLIENT_OPTS"
 elif [ "$COMMAND" = "avatarnode" ] ; then
   CLASS='org.apache.hadoop.hdfs.server.namenode.AvatarNode'
   JMX_OPTS=$HADOOP_JMX_NAMENODE_OPTS
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_GC_LOG_OPTS $HADOOP_NAMENODE_OPTS"
+elif [ "$COMMAND" = "journalnode" ] ; then
+  CLASS='org.apache.hadoop.hdfs.qjournal.server.JournalNode'
+  JMX_OPTS=$HADOOP_JMX_JOURNAL_OPTS
+  HADOOP_OPTS="$HADOOP_OPTS $HADOOP_GC_LOG_OPTS $HADOOP_JOURNAL_OPTS"
 elif [ "$COMMAND" = "secondarynamenode" ] ; then
   CLASS='org.apache.hadoop.hdfs.server.namenode.SecondaryNameNode'
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_GC_LOG_OPTS $HADOOP_SECONDARYNAMENODE_OPTS"
+elif [ "$COMMAND" = "raidnode" ] ; then
+  CLASS='org.apache.hadoop.raid.RaidNode'
+  JMX_OPTS=$HADOOP_JMX_RAIDNODE_OPTS
+  HADOOP_OPTS="$HADOOP_OPTS $HADOOP_GC_LOG_OPTS"
+  CLASSPATH=${CORONA_LIB_PATH}:${CLASSPATH}
+elif [ "$COMMAND" = "notifier" ] ; then
+  CLASS='org.apache.hadoop.hdfs.notifier.server.ServerCore'
+  if [ "$NOTIFIER_PATH" != "" ]; then
+    CLASSPATH=${CLASSPATH}:${NOTIFIER_PATH}
+  fi
+  HADOOP_OPTS="$HADOOP_OPTS $HADOOP_GC_LOG_OPTS $NOTIFIER_OPTS"
+  JMX_OPTS="$JMX_OPTS $NOTIFIER_JMX_OPTS"
+elif [ "$COMMAND" = "hdfsnfsproxy" ] ; then
+  CLASS='org.apache.hadoop.hdfs.nfs.nfs4.NFS4Server'
+  # hdfs-nfs-proxy is using log4j Rolling File Appender for
+  # log rotation, max log size, and how many backup logs to keep
+  HADOOP_LOGFILE='hdfs-nfs-proxy.log'
+  HADOOP_ROOT_LOGGER=INFO,RFA
+  HADOOP_OPTS="$HADOOP_OPTS $HADOOP_GC_LOG_OPTS"
+  JMX_OPTS="$JMX_OPTS"
+  if [ "$NFS_PROXY_PATH" != "" ]; then
+    CLASSPATH=${CLASSPATH}:${NFS_PROXY_PATH}
+  fi
+elif [ "$COMMAND" = "fsshellservice" ] ; then
+  CLASS='org.apache.hadoop.hdfs.fsshellservice.FsShellServiceImpl'
+  if [ -d "$HADOOP_HOME/build/contrib/corona/lib" ]; then
+    for f in $HADOOP_HOME/build/contrib/corona/lib/*.jar; do
+      CLASSPATH=${CLASSPATH}:$f;
+    done
+  fi
+  if [ -d "$HADOOP_HOME/build/contrib/fsshellservice/" ]; then
+    CLASSPATH=${CLASSPATH}:$HADOOP_HOME/build/contrib/fsshellservice/classes
+  fi
+  for f in $HADOOP_HOME/contrib/fsshellservice/*.jar; do
+    CLASSPATH=${CLASSPATH}:$f;
+  done
+  CLASSPATH=${CORONA_LIB_PATH}:${CLASSPATH}
 elif [ "$COMMAND" = "avatardatanode" ] ; then
   CLASS='org.apache.hadoop.hdfs.server.datanode.AvatarDataNode'
   JMX_OPTS=$HADOOP_JMX_DATANODE_OPTS
@@ -268,6 +406,9 @@ elif [ "$COMMAND" = "version" ] ; then
 elif [ "$COMMAND" = "fsck" ] ; then
   CLASS=org.apache.hadoop.hdfs.tools.DFSck
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"
+elif [ "$COMMAND" = "avatarfsck" ] ; then
+  CLASS=org.apache.hadoop.hdfs.tools.AvatarDFSck
+  HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"
 elif [ "$COMMAND" = "raidfsck" ] ; then
   CLASS=org.apache.hadoop.raid.RaidShell
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"
@@ -275,8 +416,15 @@ elif [ "$COMMAND" = "raidfsck" ] ; then
 elif [ "$COMMAND" = "raidshell" ] ; then
   CLASS=org.apache.hadoop.raid.RaidShell
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"
+elif [ "$COMMAND" = "notifiershell" ] ; then
+  CLASS=org.apache.hadoop.hdfs.notifier.tools.NotifierShell
+  HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"
 elif [ "$COMMAND" = "balancer" ] ; then
   CLASS=org.apache.hadoop.hdfs.server.balancer.Balancer
+  HADOOP_OPTS="$HADOOP_OPTS $HADOOP_BALANCER_OPTS"
+  CMDLINE_OPTS="$CMDLINE_OPTS $BALANCER_CMDLINE_OPTS"
+elif [ "$COMMAND" = "avatarbalancer" ] ; then
+  CLASS=org.apache.hadoop.hdfs.server.balancer.AvatarBalancer
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_BALANCER_OPTS"
   CMDLINE_OPTS="$CMDLINE_OPTS $BALANCER_CMDLINE_OPTS"
 elif [ "$COMMAND" = "oiv" ] ; then
@@ -284,6 +432,9 @@ elif [ "$COMMAND" = "oiv" ] ; then
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"
 elif [ "$COMMAND" = "oev" ] ; then
   CLASS=org.apache.hadoop.hdfs.tools.offlineEditsViewer.OfflineEditsViewer
+  HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"
+elif [ "$COMMAND" = "oid" ] ; then
+  CLASS=org.apache.hadoop.hdfs.tools.offlineImageViewer.OfflineImageDecompressor
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"
 elif [ "$COMMAND" = "jmxget" ] ; then
   CLASS=org.apache.hadoop.hdfs.tools.JMXGet
@@ -299,16 +450,31 @@ elif [ "$COMMAND" = "coronaclustermanager" ] ; then
   CLASS=org.apache.hadoop.corona.ClusterManagerServer
   JMX_OPTS=$HADOOP_JMX_CORONACLUSTERMANAGER_OPTS
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_GC_LOG_OPTS $HADOOP_CORONACLUSTERMANAGER_OPTS"
-  CLASSPATH=${CLASSPATH}:${CORONA_LIB_PATH}
+  # Corona lib path should be first to ensure that it uses the right thrift JAR
+  CLASSPATH=${CORONA_LIB_PATH}:${CLUSTER_MANAGER_LIB_PATH}:${CLASSPATH}
 elif [ "$COMMAND" = "coronatasktracker" ] ; then
   CLASS=org.apache.hadoop.mapred.CoronaTaskTracker
   JMX_OPTS=$HADOOP_JMX_TASKTRACKER_OPTS
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_GC_LOG_OPTS $HADOOP_TASKTRACKER_OPTS"
-  CLASSPATH=${CLASSPATH}:${CORONA_LIB_PATH}
+  # For corona task trackers, the tasks should not get the thrift library.
+  MAPREDUCE_TASK_SYSTEM_CLASSPATH=${CLASSPATH}
+  export MAPREDUCE_TASK_SYSTEM_CLASSPATH
+  # See coronaclustermanager comment
+  CLASSPATH=${CORONA_LIB_PATH}:${CLASSPATH}
 elif [ "$COMMAND" = "coronaproxyjobtracker" ] ; then
   CLASS=org.apache.hadoop.mapred.ProxyJobTracker
   JMX_OPTS=$HADOOP_JMX_CORONAPROXYJOBTRACKER_OPTS
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_GC_LOG_OPTS $HADOOP_CORONAPROXYJOBTRACKER_OPTS"
+  # See coronaclustermanager comment
+  CLASSPATH=${CORONA_LIB_PATH}:${CLASSPATH}
+elif [ "$COMMAND" = "coronaclient" ] ; then
+  CLASS=org.apache.hadoop.corona.CoronaClient
+  HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"
+  CLASSPATH=${CORONA_LIB_PATH}:${CLASSPATH}
+elif [ "$COMMAND" = "coronaadmin" ] ; then
+  CLASS=org.apache.hadoop.corona.CoronaAdmin
+  HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"
+  CLASSPATH=${CORONA_LIB_PATH}:${CLASSPATH}
 elif [ "$COMMAND" = "tasktracker" ] ; then
   CLASS=org.apache.hadoop.mapred.TaskTracker
   JMX_OPTS=$HADOOP_JMX_TASKTRACKER_OPTS
@@ -316,6 +482,16 @@ elif [ "$COMMAND" = "tasktracker" ] ; then
   HADOOP_ROOT_LOGGER=${HADOOP_TASKTRACKER_LOGGER:-$HADOOP_ROOT_LOGGER}
   if [ -n "$HADOOP_INSTANCE" ] ; then
     CMDLINE_OPTS="-instance $HADOOP_INSTANCE $CMDLINE_OPTS"
+  fi
+elif [ "$COMMAND" = "multitasktracker" ] ; then
+  CLASS=org.apache.hadoop.mapred.MultiTaskTracker
+  HADOOP_ROOT_LOGGER=${HADOOP_TASKTRACKER_LOGGER:-$HADOOP_ROOT_LOGGER}
+  HADOOP_OPTS="$HADOOP_OPTS $HADOOP_MULTITASKTRACKER_OPTS"
+  # This should be the number of tasktrackers
+  if [ -n "$MULTI_TT_OPTIONS" ] ; then
+    CMDLINE_OPTS="$MULTI_TT_OPTIONS"
+  else
+    CMDLINE_OPTS="1"
   fi
 elif [ "$COMMAND" = "job" ] ; then
   CLASS=org.apache.hadoop.mapred.JobClient
@@ -327,6 +503,9 @@ elif [ "$COMMAND" = "pipes" ] ; then
 elif [ "$COMMAND" = "version" ] ; then
   CLASS=org.apache.hadoop.util.VersionInfo
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"
+elif [ "$COMMAND" = "onejar" ] ; then
+  CLASS=org.apache.hadoop.util.RunJar
+  HADOOP_OPTS="$HADOOP_OPTS -Done-jar.jar.path=$1"
 elif [ "$COMMAND" = "jar" ] ; then
   CLASS=org.apache.hadoop.util.RunJar
 elif [ "$COMMAND" = "fastcopy" ] ; then
@@ -335,7 +514,7 @@ elif [ "$COMMAND" = "fastcopy" ] ; then
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"
 elif [ "$COMMAND" = "distcp" ] ; then
   CLASS=org.apache.hadoop.tools.DistCp
-  CLASSPATH=${CLASSPATH}:${TOOL_PATH}
+  CLASSPATH=${CORONA_LIB_PATH}:${CLASSPATH}:${TOOL_PATH}
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"
 elif [ "$COMMAND" = "daemonlog" ] ; then
   CLASS=org.apache.hadoop.log.LogLevel
@@ -388,6 +567,11 @@ if [ -d "${HADOOP_HOME}/build/native" -o -d "${HADOOP_HOME}/lib/native" ]; then
   fi
 fi
 
+# use fbcode gcc in nfs proxy java.library.path
+if [ "$COMMAND" = "hdfsnfsproxy" ] ; then
+  JAVA_LIBRARY_PATH=${JAVA_LIBRARY_PATH}:/usr/local/fbcode/gcc-4.6.2-glibc-2.5.1/lib;
+fi
+
 # cygwin path translation
 if $cygwin; then
   JAVA_LIBRARY_PATH=`cygpath -p "$JAVA_LIBRARY_PATH"`
@@ -424,4 +608,6 @@ if [ "$HADOOP_DEPLOYMENT" == "server" ]; then
 fi
 
 # run it
-exec "$JAVA" $JAVA_HEAP_MAX $HADOOP_OPTS $JMX_OPTS -classpath "$CLASSPATH" $CLASS $CMDLINE_OPTS "$@"
+export CLASSPATH
+export JVM_PID=$$
+exec "$JAVA" $JAVA_HEAP_MAX $HADOOP_OPTS $JMX_OPTS "-Dfb_hadoop_version=0.20" $CLASS $CMDLINE_OPTS "$@"

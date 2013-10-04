@@ -1,5 +1,7 @@
 package org.apache.hadoop.hdfs.server.namenode;
 
+import java.io.FileNotFoundException;
+import java.io.IOException;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
@@ -10,14 +12,15 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.DFSTestUtil;
+import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.hdfs.MiniDFSCluster.DataNodeProperties;
+import org.apache.hadoop.hdfs.TestDistributedFileSystem;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.server.namenode.FSNamesystem.NumberReplicas;
-import org.apache.hadoop.hdfs.server.namenode.metrics.NameNodeActivtyMBean;
 
 import junit.framework.TestCase;
 
@@ -28,9 +31,40 @@ import junit.framework.TestCase;
 public class TestNodeCount extends TestCase {
   static final Log LOG = LogFactory.getLog(TestNodeCount.class);
   
+  
+  public void testCreateFileParentIsFile() throws IOException {
+    Configuration conf = new Configuration();
+    MiniDFSCluster cluster = new MiniDFSCluster(conf, 0, true, null);
+
+    try {
+      FileSystem fs = cluster.getFileSystem();
+      INodeDirectoryWithQuota in =
+          (INodeDirectoryWithQuota) cluster.getNameNode().getNamesystem().dir.getExistingPathINodes("/")[0];
+
+      TestCase.assertNotNull(DFSUtil.convertToDFS(fs));
+      
+      TestDistributedFileSystem.createFile(fs, new Path("/testCreateFileParentIsFile"));
+      TestCase.assertEquals(2, in.numItemsInTree());
+
+      
+      try {
+        TestDistributedFileSystem.createFile(fs, new Path("/testCreateFileParentIsFile/f"));
+        TestCase.fail();
+      } catch (FileNotFoundException ioe) {        
+      }
+      TestCase.assertEquals(2, in.numItemsInTree());
+      
+    } finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }    
+  }
+  
   public void testNodeCount() throws Exception {
     // start a mini dfs cluster of 2 nodes
     final Configuration conf = new Configuration();
+    conf.setInt("dfs.replication.interval", 10);
     final short REPLICATION_FACTOR = (short)2;
     final MiniDFSCluster cluster = 
       new MiniDFSCluster(conf, REPLICATION_FACTOR, true, null);
@@ -116,9 +150,8 @@ public class TestNodeCount extends TestCase {
       // restart the first datanode
       cluster.restartDataNode(dnprop);
       cluster.waitActive(false);
-
-      LOG.info("Waiting for excess replicas to be detected");
       // check if excessive replica is detected
+      LOG.info("Waiting for excess replicas to be detected");
       waitForExcessReplicasToChange(namesystem, block, 2);
     } finally {
       cluster.shutdown();
@@ -136,6 +169,7 @@ public class TestNodeCount extends TestCase {
       namesystem.readLock();
       try {
         num = namesystem.countNodes(block);
+        LOG.info("We have " + num.excessReplicas() + " excess replica");
       } finally {
         namesystem.readUnlock();
       }

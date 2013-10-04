@@ -21,21 +21,27 @@ package org.apache.hadoop.raid;
 import java.io.OutputStream;
 import java.io.InputStream;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.zip.CRC32;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hdfs.DFSClient.DFSDataInputStream;
+import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+import org.apache.hadoop.hdfs.util.InjectionEvent;
+import org.apache.hadoop.util.InjectionHandler;
 import org.apache.hadoop.util.Progressable;
-import org.apache.hadoop.util.StringUtils;
+
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * Reads data from multiple input streams in parallel.
@@ -44,6 +50,10 @@ public class ParallelStreamReader {
   public static final Log LOG = LogFactory.getLog(ParallelStreamReader.class);
   Progressable reporter;
   InputStream[] streams;
+  OutputStream[] outs = null;
+  long[] endOffsets; //read boundary of each stream
+  final boolean computeChecksum;
+  CRC32[] checksums = null;
   ExecutorService readPool;
   Semaphore slots;
   int numThreads;
@@ -54,11 +64,14 @@ public class ParallelStreamReader {
 
   public static class ReadResult {
     public byte[][] readBufs;
+    public int[] numRead;
     public IOException[] ioExceptions;
     ReadResult(int numStreams, int bufSize) {
       this.readBufs = new byte[numStreams][];
+      this.numRead = new int[numStreams];
       for (int i = 0; i < readBufs.length; i++) {
         this.readBufs[i] = new byte[bufSize];
+        numRead[i] = 0;
       }
       this.ioExceptions = new IOException[readBufs.length];
     }
@@ -69,6 +82,7 @@ public class ParallelStreamReader {
           ioExceptions[idx] = null;
           return;
         }
+        LOG.info("Set Exception: " + e.getMessage(), e);
         if (e instanceof IOException) {
           ioExceptions[idx] = (IOException) e;
         } else {
@@ -87,11 +101,46 @@ public class ParallelStreamReader {
       }
       return null;
     }
+    
+    List<Integer> getErrorIdx() {
+      List<Integer> errorIdxs = new ArrayList<Integer>();
+      synchronized(ioExceptions) {
+        for (int i = 0; i< ioExceptions.length; i++) {
+          if (ioExceptions[i] != null) {
+            errorIdxs.add(i);
+          }
+        }
+      }
+      return errorIdxs;
+    }
   }
 
   BlockingQueue<ReadResult> boundedBuffer;
   Thread mainThread;
 
+  public ParallelStreamReader(
+      Progressable reporter,
+      InputStream[] streams,
+      int bufSize,
+      int numThreads,
+      int boundedBufferCapacity,
+      long maxBytesPerStream) throws IOException {
+    this(reporter, streams, bufSize, numThreads, boundedBufferCapacity,
+        maxBytesPerStream, false);
+  }
+  
+  public ParallelStreamReader(
+      Progressable reporter,
+      InputStream[] streams,
+      int bufSize,
+      int numThreads,
+      int boundedBufferCapacity,
+      long maxBytesPerStream,
+      boolean computeChecksum) throws IOException {
+    this(reporter, streams, bufSize, numThreads, boundedBufferCapacity,
+        maxBytesPerStream, false, null);
+  }
+  
   /**
    * Reads data from multiple streams in parallel and puts the data in a queue.
    * @param streams The input streams to read from.
@@ -99,17 +148,50 @@ public class ParallelStreamReader {
    * @param numThreads Number of threads to use for parallelism.
    * @param boundedBuffer The queue to place the results in.
    */
+  
   public ParallelStreamReader(
       Progressable reporter,
       InputStream[] streams,
       int bufSize,
       int numThreads,
       int boundedBufferCapacity,
-      long maxBytesPerStream) {
+      long maxBytesPerStream, 
+      boolean computeChecksum,
+      OutputStream[] outs) throws IOException {
     this.reporter = reporter;
+    this.computeChecksum = computeChecksum;
     this.streams = new InputStream[streams.length];
+    this.endOffsets = new long[streams.length];
+    if (computeChecksum) { 
+      this.checksums = new CRC32[streams.length];
+    }
+    this.outs = outs;
     for (int i = 0; i < streams.length; i++) {
       this.streams[i] = streams[i];
+      if (this.streams[i] instanceof DFSDataInputStream) {
+        DFSDataInputStream stream = (DFSDataInputStream)this.streams[i];
+        // in directory raiding, the block size for each input stream 
+        // might be different, so we need to determine the endOffset of
+        // each stream by their own block size.
+        List<LocatedBlock> blocks = stream.getAllBlocks();
+        if (blocks.size() == 0) {
+          this.endOffsets[i] = Long.MAX_VALUE;
+          if (computeChecksum) {
+            this.checksums[i] = null;
+          }
+        } else {
+          long blockSize = blocks.get(0).getBlockSize();
+          this.endOffsets[i] = stream.getPos() + blockSize;
+          if (computeChecksum) {
+            this.checksums[i] = new CRC32();
+          }
+        }
+      } else {
+        this.endOffsets[i] = Long.MAX_VALUE;
+        if (computeChecksum) {
+          this.checksums[i] = null;
+        }
+      }
       streams[i] = null; // Take over ownership of streams.
     }
     this.bufSize = bufSize;
@@ -122,12 +204,33 @@ public class ParallelStreamReader {
     }
     this.remainingBytesPerStream = maxBytesPerStream;
     this.slots = new Semaphore(this.numThreads);
-    this.readPool = Executors.newFixedThreadPool(this.numThreads);
+    ThreadFactory ParallelStreamReaderFactory = new ThreadFactoryBuilder()
+      .setNameFormat("ParallelStreamReader-read-pool-%d")
+      .build();
+    this.readPool = Executors.newFixedThreadPool(this.numThreads, ParallelStreamReaderFactory);
     this.mainThread = new MainThread();
+    mainThread.setName("ParallelStreamReader-main");
   }
 
   public void start() {
     this.mainThread.start();
+  }
+  
+  public void collectSrcBlocksChecksum(ChecksumStore ckmStore)
+      throws IOException {
+    if (ckmStore == null) {
+      return;
+    }
+    LOG.info("Store the checksums of source blocks into checksumStore");
+    for (int i = 0; i < streams.length; i++) {
+      if (streams[i] != null &&
+          streams[i] instanceof DFSDataInputStream && 
+          !(streams[i] instanceof RaidUtils.ZeroInputStream)) {
+        DFSDataInputStream stream = (DFSDataInputStream)this.streams[i];
+        Long newVal = checksums[i].getValue(); 
+        ckmStore.putIfAbsentChecksum(stream.getCurrentBlock(), newVal);
+      }
+    }
   }
 
   public void shutdown() {
@@ -221,13 +324,27 @@ public class ParallelStreamReader {
         }
         boolean eofOK = true;
         byte[] buffer = readResult.readBufs[idx];
-        RaidUtils.readTillEnd(streams[idx], buffer, eofOK);
+        int numRead = RaidUtils.readTillEnd(streams[idx], buffer, eofOK,
+            endOffsets[idx], (int) Math.min(remainingBytesPerStream,
+            buffer.length));
+        if (outs != null && outs.length > 0) {
+          InjectionHandler.processEventIO(
+              InjectionEvent.RAID_ENCODING_FAILURE_BLOCK_MISSING, outs[0]);
+        }
+        if (computeChecksum && numRead > 0) {
+          if (checksums[idx] != null) {
+            checksums[idx].update(buffer, 0, numRead);
+          }
+        }
+        readResult.numRead[idx] = numRead;
       } catch (Exception e) {
         LOG.warn("Encountered exception in stream " + idx, e);
         readResult.setException(idx, e);
-        try {
-          streams[idx].close();
-        } catch (IOException ioe) {}
+        if (streams[idx] != null) {
+          try {
+            streams[idx].close();
+          } catch (IOException ioe) {}
+        }
         streams[idx] = null;
       } finally {
         ParallelStreamReader.this.slots.release();

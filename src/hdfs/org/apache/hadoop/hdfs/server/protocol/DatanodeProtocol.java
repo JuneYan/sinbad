@@ -23,7 +23,6 @@ import java.io.*;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeID;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
-import org.apache.hadoop.hdfs.server.protocol.ReceivedDeletedBlockInfo;
 import org.apache.hadoop.ipc.VersionedProtocol;
 
 /**********************************************************************
@@ -34,7 +33,7 @@ import org.apache.hadoop.ipc.VersionedProtocol;
  * returning values from these functions.
  *
  **********************************************************************/
-public interface DatanodeProtocol extends VersionedProtocol {
+public interface DatanodeProtocol extends VersionedProtocol, BlockSynchronizationProtocol {
   /**
    * 20: nextGenerationStamp has a new parameter indicating if it is for
    * NameNode initiated lease recovery or not
@@ -58,6 +57,7 @@ public interface DatanodeProtocol extends VersionedProtocol {
   final static int DNA_REGISTER = 4;   // re-register
   final static int DNA_FINALIZE = 5;   // finalize previous upgrade
   final static int DNA_RECOVERBLOCK = 6;  // request a block recovery
+  final static int DNA_RAIDTASK = 7;    // request a raid task (encoding or block fixing).
 
   /** 
    * Register Datanode.
@@ -69,8 +69,24 @@ public interface DatanodeProtocol extends VersionedProtocol {
    * new storageID if the datanode did not have one and
    * registration ID for further communication.
    */
+  @Deprecated
   public DatanodeRegistration register(DatanodeRegistration registration
                                        ) throws IOException;
+
+  /** 
+   * Register Datanode.
+   * if the reported data transfer version does not match the one in NameNode,
+   * namenode should disallow datanode to register
+   *
+   * @param registration datanode info
+   * @param dataTransferVersion the data transfer protocol version
+   * 
+   * @return updated {@link org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration}, which contains 
+   * new storageID if the datanode did not have one and
+   * registration ID for further communication.
+   */
+  public DatanodeRegistration register(DatanodeRegistration registration,
+      int dataTransferVersion) throws IOException;
 
   /**
    * keepAlive tells the namenode that the datanode is alive and kicking.
@@ -148,7 +164,7 @@ public interface DatanodeProtocol extends VersionedProtocol {
    * this DataNode, it will call blockReceived().
    */
   public void blockReceivedAndDeleted(DatanodeRegistration registration,
-                                      ReceivedDeletedBlockInfo[] receivedAndDeletedBlocks)
+                                      IncrementalBlockReport receivedAndDeletedBlocks)
                                       throws IOException;
   
   /**

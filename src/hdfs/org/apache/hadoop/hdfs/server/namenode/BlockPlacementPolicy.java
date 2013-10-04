@@ -166,7 +166,7 @@ public abstract class BlockPlacementPolicy {
                                     List<DatanodeDescriptor> chosenNodes,
                                     List<Node> excludesNodes,
                                     long blocksize) {
-    return chooseTarget(srcInode.getFullPathName(), numOfReplicas, writer,
+    return chooseTarget(FSNamesystem.getFullPathName(srcInode), numOfReplicas, writer,
                         chosenNodes, blocksize);
   }
 

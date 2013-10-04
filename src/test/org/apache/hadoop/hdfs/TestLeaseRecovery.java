@@ -28,6 +28,7 @@ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.protocol.LocatedBlockWithMetaInfo;
 import org.apache.hadoop.hdfs.server.datanode.DataNode;
+import org.apache.hadoop.hdfs.server.datanode.FSDataset;
 import org.apache.hadoop.hdfs.server.datanode.FSDatasetTestUtil;
 import org.apache.hadoop.hdfs.server.datanode.TestInterDatanodeProtocol;
 import org.apache.hadoop.hdfs.server.protocol.BlockMetaDataInfo;
@@ -90,7 +91,7 @@ public class TestLeaseRecovery extends junit.framework.TestCase {
       DistributedFileSystem fileSystem = (DistributedFileSystem) cluster.getFileSystem();
       int initialRefCount = ClientAdapter.getRefCount(client);
       String filename = "/file1";
-      DFSClient.DFSOutputStream out = (DFSClient.DFSOutputStream)
+      DFSOutputStream out = (DFSOutputStream)
         ((DistributedFileSystem) fileSystem).getClient().create(
           filename, FsPermission.getDefault(), true, (short) 5, 1024,
           new Progressable() {
@@ -104,7 +105,7 @@ public class TestLeaseRecovery extends junit.framework.TestCase {
       out.sync();
 
       DatanodeInfo[] dataNodeInfos =
-        ((DFSClient.DFSOutputStream)out).getPipeline();
+        ((DFSOutputStream)out).getPipeline();
 
       // killing one DN in the pipe and doing a write triggers lease recovery
       // and will result in the refcount being adjusted; if there's a lease
@@ -120,11 +121,17 @@ public class TestLeaseRecovery extends junit.framework.TestCase {
       out.close();
   }
   
+  public void testBlockSynchronizationInlineChecksum() throws Exception {
+    runTestBlockSynchronization(false, true);
+  }
+  public void testBlockSynchronizationWithZeroBlockInlineChecksum() throws Exception {
+    runTestBlockSynchronization(true, true);
+  }
   public void testBlockSynchronization() throws Exception {
-    runTestBlockSynchronization(false);
+    runTestBlockSynchronization(false, false);
   }
   public void testBlockSynchronizationWithZeroBlock() throws Exception {
-    runTestBlockSynchronization(true);
+    runTestBlockSynchronization(true, false);
   }
 
 
@@ -134,9 +141,12 @@ public class TestLeaseRecovery extends junit.framework.TestCase {
    * Finally, it triggers block synchronization to synchronize all stored block.
    * @param forceOneBlockToZero if true, will truncate one block to 0 length
    */
-  public void runTestBlockSynchronization(boolean forceOneBlockToZero)
-  throws Exception {
+  public void runTestBlockSynchronization(boolean forceOneBlockToZero,
+      boolean useInlineChecksum)  throws Exception {
     final int ORG_FILE_SIZE = 3000; 
+    for (DataNode dn : cluster.getDataNodes()) {
+      dn.useInlineChecksum = useInlineChecksum;
+    }
 
       //create a file
       DistributedFileSystem dfs = (DistributedFileSystem)cluster.getFileSystem();
@@ -185,7 +195,8 @@ public class TestLeaseRecovery extends junit.framework.TestCase {
       Block[] newblocks = new Block[REPLICATION_NUM];
       for(int i = 0; i < REPLICATION_NUM; i++) {
         DataNode dn = datanodes[i];
-        FSDatasetTestUtil.truncateBlock(dn, lastblock, newblocksizes[i], namespaceId);
+      FSDatasetTestUtil.truncateBlock(dn, lastblock, newblocksizes[i],
+          namespaceId, useInlineChecksum);
         newblocks[i] = new Block(lastblock.getBlockId(), newblocksizes[i],
             lastblock.getGenerationStamp());
         checkMetaInfo(namespaceId, newblocks[i], idps[i]);
@@ -200,7 +211,9 @@ public class TestLeaseRecovery extends junit.framework.TestCase {
       DataNode primary = datanodes[primarydatanodeindex];
       DataNode.LOG.info("primary.dnRegistration=" + primary.getDNRegistrationForNS(
           cluster.getNameNode().getNamespaceID()));
-      primary.recoverBlocks(namespaceId, new Block[]{lastblock}, new DatanodeInfo[][]{datanodeinfos}).join();
+    primary.recoverBlocks(namespaceId, new Block[] { lastblock },
+        new DatanodeInfo[][] { datanodeinfos },
+        System.currentTimeMillis() + 3000).join();
 
       BlockMetaDataInfo[] updatedmetainfo = new BlockMetaDataInfo[REPLICATION_NUM];
       int minsize = min(newblocksizes);

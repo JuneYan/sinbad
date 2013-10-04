@@ -38,6 +38,10 @@
       name="log4j"
       rev="${log4j.version}"
       conf="common->master"/>
+    <dependency org="com.google.guava"
+      name="guava"
+      rev="${guava.version}"
+      conf="common->master"/>
     <dependency org="org.mortbay.jetty"
       name="servlet-api-2.5"
       rev="${servlet-api-2.5.version}"
@@ -74,13 +78,34 @@
       name="servlet-api-2.5"
       rev="${servlet-api-2.5.version}"
       conf="common->default"/>
+    <dependency org="org.jboss.netty"
+      name="netty"
+      rev="${netty.version}"
+      conf="common->default"/>
     <dependency org="org.eclipse.jdt"
       name="core"
       rev="${core.version}"
       conf="common->default"/>
+    <dependency org="org.mockito"
+      name="mockito-all"
+      rev="${mockito-all.version}"
+      conf="common->master"/>
     <dependency org="org.json"
       name="json"
       rev="${json.version}"
+      conf="common->default"/>
+    <!-- swift -->
+    <dependency org="com.facebook.swift"
+      name="swift-codec"
+      rev="${swift.version}"
+      conf="common->default"/>
+    <dependency org="com.facebook.swift"
+      name="swift-service"
+      rev="${swift.version}"
+      conf="common->default"/>
+    <dependency org="com.facebook.swift"
+      name="swift-annotations"
+      rev="${swift.version}"
       conf="common->default"/>
   </dependencies>
 </ivy-module>

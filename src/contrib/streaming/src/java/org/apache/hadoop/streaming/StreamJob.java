@@ -47,6 +47,7 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.filecache.DistributedCache;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.BytesWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.fs.FileAlreadyExistsException;
 import org.apache.hadoop.mapred.FileInputFormat;
@@ -106,6 +107,23 @@ public class StreamJob implements Tool {
   
   @Override
   public int run(String[] args) throws Exception {
+    // Set up graceful shutdowns
+    Runtime.getRuntime().addShutdownHook(new Thread() {
+      @Override
+      public void run() {
+        if (running_ != null) {
+          try {
+            if (!running_.isComplete()) {
+              LOG.warn("killing " + running_.getTrackingURL());
+              running_.killJob();
+            }
+          } catch (IOException e) {
+            LOG.error("error killing " + running_.getID(), e);
+          }
+        }
+      }
+    });
+
     try {
       this.argv_ = args;
       init();
@@ -145,7 +163,7 @@ public class StreamJob implements Tool {
 
   /**
    * This is the method that actually 
-   * intializes the job conf and submits the job
+   * initializes the job conf and submits the job
    * to the jobtracker
    * @throws IOException
    * @deprecated use {@link #run(String[])} instead.
@@ -691,8 +709,18 @@ public class StreamJob implements Tool {
 
     jobConf_.setInputFormat(fmt);
 
-    jobConf_.setOutputKeyClass(Text.class);
-    jobConf_.setOutputValueClass(Text.class);
+    String key_value_class = jobConf_.get("stream.key_value.class", "Text");
+    if (key_value_class.equalsIgnoreCase("Text")) {
+      jobConf_.setOutputKeyClass(Text.class);
+      jobConf_.setOutputValueClass(Text.class);
+    } else if (key_value_class.equalsIgnoreCase("BytesWritable")) {
+      jobConf_.setOutputKeyClass(BytesWritable.class);
+      jobConf_.setOutputValueClass(BytesWritable.class);
+    } else {
+      throw new InvalidJobConfException("Key value class " +
+        key_value_class + " is not supported. Only Text and " +
+        " BytesWritable are supported.");
+    }
 
     jobConf_.set("stream.addenvironment", addTaskEnvironment_);
 
@@ -770,7 +798,7 @@ public class StreamJob implements Tool {
       fmt = TextOutputFormat.class;
     }
     jobConf_.setOutputFormat(fmt);
-
+    
     if (partitionerSpec_!= null) {
       c = StreamUtil.goodClassOrNull(jobConf_, partitionerSpec_, defaultPackage);
       if (c != null) {

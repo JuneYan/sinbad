@@ -19,6 +19,7 @@ package org.apache.hadoop.hdfs.tools.offlineImageViewer;
 
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.Date;
@@ -26,14 +27,19 @@ import java.util.Date;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo.AdminStates;
+import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.protocol.LayoutVersion;
 import org.apache.hadoop.hdfs.protocol.LayoutVersion.Feature;
-import org.apache.hadoop.hdfs.server.namenode.FSImage;
+import org.apache.hadoop.hdfs.server.namenode.FSImageSerialization;
+import org.apache.hadoop.hdfs.server.namenode.INode;
 import org.apache.hadoop.hdfs.tools.offlineImageViewer.ImageVisitor.ImageElement;
+import org.apache.hadoop.hdfs.util.InjectionEvent;
+import org.apache.hadoop.io.BufferedByteInputStream;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.WritableUtils;
 import org.apache.hadoop.io.compress.CompressionCodec;
 import org.apache.hadoop.io.compress.CompressionCodecFactory;
+import org.apache.hadoop.util.InjectionHandler;
 
 /**
  * ImageLoaderCurrent processes Hadoop FSImage files and walks over
@@ -43,14 +49,17 @@ import org.apache.hadoop.io.compress.CompressionCodecFactory;
  * The only difference between v18 and v19 was the utilization of the
  * stickybit.  Therefore, the same viewer can reader either format.
  *
- * Versions -19 fsimage layout (with changes from -16 up):
+ * fsimage layout (with changes from -16 up):
  * Image version (int)
  * Namepsace ID (int)
  * NumFiles (long)
  * Generation stamp (long)
+ * Last Transaction ID (long) // added in -37
+ * Last INode ID (long) // added in -42
  * INodes (count = NumFiles)
  *  INode
  *    Path (String)
+ *    INode ID (long) // added in -42
  *    Replication (short)
  *    Modification Time (long as date)
  *    Access Time (long) // added in -16
@@ -61,6 +70,7 @@ import org.apache.hadoop.io.compress.CompressionCodecFactory;
  *        Block ID (long)
  *        Num bytes (long)
  *        Generation stamp (long)
+ *        Block checksum (int) // added in -43
  *    Namespace Quota (long)
  *    Diskspace Quota (long) // added in -18
  *    Permissions
@@ -72,6 +82,7 @@ import org.apache.hadoop.io.compress.CompressionCodecFactory;
  * INodesUnderConstruction (count = NumINodesUnderConstruction)
  *  INodeUnderConstruction
  *    Path (bytes as string)
+ *    INode ID (long) // added in -42
  *    Replication (short)
  *    Modification time (long as date)
  *    Preferred block size (long)
@@ -81,6 +92,7 @@ import org.apache.hadoop.io.compress.CompressionCodecFactory;
  *        Block ID (long)
  *        Num bytes (long)
  *        Generation stamp (long)
+ *        Block checksum (int)
  *    Permissions
  *      Username (String)
  *      Groupname (String)
@@ -100,10 +112,13 @@ import org.apache.hadoop.io.compress.CompressionCodecFactory;
  *
  */
 class ImageLoaderCurrent implements ImageLoader {
-  protected final DateFormat dateFormat = 
+  static final int BASE_BUFFER_SIZE = 512 * 1024; // 512KB
+  private static final Date tempDate = new Date(0);
+  protected final static DateFormat dateFormat = 
                                       new SimpleDateFormat("yyyy-MM-dd HH:mm");
   private static int[] versions = { -16, -17, -18, -19, -20, -21, -22, -23,
-      -24, -25, -26, -27, -28, -30, -31, -32, -33, -34, -35, -36 };
+      -24, -25, -26, -27, -28, -30, -31, -32, -33, -34, -35, -36, -37, -38,
+      -39, -40, -41, -42, -43, -44 };
   private int imageVersion = 0;
 
   /* (non-Javadoc)
@@ -124,6 +139,7 @@ class ImageLoaderCurrent implements ImageLoader {
   public void loadImage(DataInputStream in, ImageVisitor v,
       boolean skipBlocks) throws IOException {
     try {
+      InjectionHandler.processEvent(InjectionEvent.IMAGE_LOADER_CURRENT_START);
       v.start();
       v.visitEnclosingElement(ImageElement.FS_IMAGE);
 
@@ -135,8 +151,16 @@ class ImageLoaderCurrent implements ImageLoader {
       v.visit(ImageElement.NAMESPACE_ID, in.readInt());
 
       long numInodes = in.readLong();
+      v.setNumberOfFiles(numInodes);
 
       v.visit(ImageElement.GENERATION_STAMP, in.readLong());
+      if (imageVersion <= FSConstants.STORED_TXIDS) {
+        v.visit(ImageElement.LAST_TXID, in.readLong());
+      }
+      
+      if (LayoutVersion.supports(Feature.ADD_INODE_ID, imageVersion)) {
+        v.visit(ImageElement.LAST_INODE_ID, in.readLong());
+      }
 
       if (LayoutVersion.supports(Feature.FSIMAGE_COMPRESSION, imageVersion)) {
         boolean isCompressed = in.readBoolean();
@@ -154,6 +178,7 @@ class ImageLoaderCurrent implements ImageLoader {
           in = new DataInputStream(codec.createInputStream(in));
         }
       }
+      in = BufferedByteInputStream.wrapInputStream(in, 8 * BASE_BUFFER_SIZE, BASE_BUFFER_SIZE);
       processINodes(in, v, numInodes, skipBlocks);
 
       processINodesUC(in, v, skipBlocks);
@@ -182,10 +207,17 @@ class ImageLoaderCurrent implements ImageLoader {
                            ImageElement.NUM_INODES_UNDER_CONSTRUCTION, numINUC);
 
     for(int i = 0; i < numINUC; i++) {
+      checkInterruption();
       v.visitEnclosingElement(ImageElement.INODE_UNDER_CONSTRUCTION);
-      byte [] name = FSImage.readBytes(in);
+      
+      byte [] name = FSImageSerialization.readBytes(in);
       String n = new String(name, "UTF8");
       v.visit(ImageElement.INODE_PATH, n);
+      
+      if (LayoutVersion.supports(Feature.ADD_INODE_ID, imageVersion)) {
+        v.visit(ImageElement.INODE_ID, in.readLong());
+      }
+      
       v.visit(ImageElement.REPLICATION, in.readShort());
       v.visit(ImageElement.MODIFICATION_TIME, formatDate(in.readLong()));
 
@@ -194,8 +226,8 @@ class ImageLoaderCurrent implements ImageLoader {
       processBlocks(in, v, numBlocks, skipBlocks);
 
       processPermission(in, v);
-      v.visit(ImageElement.CLIENT_NAME, FSImage.readString(in));
-      v.visit(ImageElement.CLIENT_MACHINE, FSImage.readString(in));
+      v.visit(ImageElement.CLIENT_NAME, FSImageSerialization.readString(in));
+      v.visit(ImageElement.CLIENT_MACHINE, FSImageSerialization.readString(in));
 
       // Skip over the datanode descriptors, which are still stored in the
       // file but are not used by the datanode or loaded into memory
@@ -206,8 +238,8 @@ class ImageLoaderCurrent implements ImageLoader {
         in.readLong();
         in.readLong();
         in.readInt();
-        FSImage.readString(in);
-        FSImage.readString(in);
+        FSImageSerialization.readString(in);
+        FSImageSerialization.readString(in);
         WritableUtils.readEnum(in, AdminStates.class);
       }
 
@@ -236,7 +268,13 @@ class ImageLoaderCurrent implements ImageLoader {
     }
     
     if(skipBlocks) {
-      int bytesToSkip = ((Long.SIZE * 3 /* fields */) / 8 /*bits*/) * numBlocks;
+      int fieldsBytes = Long.SIZE * 3;
+      if (LayoutVersion.supports(Feature.BLOCK_CHECKSUM, imageVersion)) {
+        // For block checksum
+        fieldsBytes += Integer.SIZE;
+      }
+      
+      int bytesToSkip = ((fieldsBytes /* fields */) / 8 /*bits*/) * numBlocks;
       if(in.skipBytes(bytesToSkip) != bytesToSkip)
         throw new IOException("Error skipping over blocks");
       
@@ -246,6 +284,9 @@ class ImageLoaderCurrent implements ImageLoader {
         v.visit(ImageElement.BLOCK_ID, in.readLong());
         v.visit(ImageElement.NUM_BYTES, in.readLong());
         v.visit(ImageElement.GENERATION_STAMP, in.readLong());
+        if (LayoutVersion.supports(Feature.BLOCK_CHECKSUM, imageVersion)) {
+          v.visit(ImageElement.BLOCK_CHECKSUM, in.readInt());
+        }
         v.leaveEnclosingElement(); // Block
       }
     }
@@ -261,8 +302,8 @@ class ImageLoaderCurrent implements ImageLoader {
   private void processPermission(DataInputStream in, ImageVisitor v)
       throws IOException {
     v.visitEnclosingElement(ImageElement.PERMISSIONS);
-    v.visit(ImageElement.USER_NAME, Text.readString(in));
-    v.visit(ImageElement.GROUP_NAME, Text.readString(in));
+    v.visit(ImageElement.USER_NAME, Text.readStringOpt(in));
+    v.visit(ImageElement.GROUP_NAME, Text.readStringOpt(in));
     FsPermission fsp = new FsPermission(in.readShort());
     v.visit(ImageElement.PERMISSION_STRING, fsp.toString());
     v.leaveEnclosingElement(); // Permissions
@@ -314,7 +355,7 @@ class ImageLoaderCurrent implements ImageLoader {
   
   private int processDirectory(DataInputStream in, ImageVisitor v,
      boolean skipBlocks) throws IOException {
-    String parentName = FSImage.readString(in);
+    String parentName = FSImageSerialization.readString(in);
     int numChildren = in.readInt();
     for (int i=0; i<numChildren; i++) {
       processINode(in, v, skipBlocks, parentName);
@@ -349,8 +390,10 @@ class ImageLoaderCurrent implements ImageLoader {
     */
   private void processINode(DataInputStream in, ImageVisitor v,
       boolean skipBlocks, String parentName) throws IOException {
+    checkInterruption();
     v.visitEnclosingElement(ImageElement.INODE);
-    String pathName = FSImage.readString(in);
+
+    String pathName = FSImageSerialization.readString(in);
     if (parentName != null) {  // local name
       pathName = "/" + pathName;
       if (!"/".equals(parentName)) { // children of non-root directory
@@ -359,10 +402,31 @@ class ImageLoaderCurrent implements ImageLoader {
     }
 
     v.visit(ImageElement.INODE_PATH, pathName);
+    
+    
+    if (LayoutVersion.supports(Feature.ADD_INODE_ID, imageVersion)) {
+      v.visit(ImageElement.INODE_ID, in.readLong());
+    }
+    
+    if (LayoutVersion.supports(Feature.HARDLINK, imageVersion)) {
+      byte inodeType = in.readByte();
+      if (inodeType == INode.INodeType.HARDLINKED_INODE.type) {
+        v.visit(ImageElement.INODE_TYPE, INode.INodeType.HARDLINKED_INODE.toString());
+        long hardlinkID =  WritableUtils.readVLong(in);
+        v.visit(ImageElement.INODE_HARDLINK_ID, hardlinkID);
+      } else if (inodeType == INode.INodeType.RAIDED_INODE.type) {
+        v.visit(ImageElement.INODE_TYPE, INode.INodeType.RAIDED_INODE.toString());
+        String codecId = WritableUtils.readString(in);
+        v.visit(ImageElement.RAID_CODEC_ID, codecId);
+      } else {
+        v.visit(ImageElement.INODE_TYPE, INode.INodeType.REGULAR_INODE.toString());
+      }
+    }
+    
     v.visit(ImageElement.REPLICATION, in.readShort());
-    v.visit(ImageElement.MODIFICATION_TIME, formatDate(in.readLong()));
+    v.visit(ImageElement.MODIFICATION_TIME, in.readLong());
     if(LayoutVersion.supports(Feature.FILE_ACCESS_TIME, imageVersion))
-      v.visit(ImageElement.ACCESS_TIME, formatDate(in.readLong()));
+      v.visit(ImageElement.ACCESS_TIME, in.readLong());
     v.visit(ImageElement.BLOCK_SIZE, in.readLong());
     int numBlocks = in.readInt();
 
@@ -387,7 +451,15 @@ class ImageLoaderCurrent implements ImageLoader {
    * @param date Date as read from image file
    * @return String version of date format
    */
-  private String formatDate(long date) {
-    return dateFormat.format(new Date(date));
+  static String formatDate(long date) {
+    tempDate.setTime(date);
+    return dateFormat.format(tempDate);
+  }
+  
+  private void checkInterruption() throws IOException {
+    if (Thread.currentThread().isInterrupted()) {
+      InjectionHandler.processEvent(InjectionEvent.IMAGE_LOADER_CURRENT_INTERRUPT);
+      throw new InterruptedIOException("Image loader interrupted");
+    }
   }
 }

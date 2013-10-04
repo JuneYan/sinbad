@@ -20,9 +20,11 @@ package org.apache.hadoop.mapred;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
@@ -32,20 +34,26 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.Vector;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.corona.TopologyCache;
+import org.apache.hadoop.corona.SessionPriority;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.mapred.Counters;
+import org.apache.hadoop.mapred.TaskStatus;
 import org.apache.hadoop.mapred.JobHistory.Values;
+import org.apache.hadoop.mapred.JobInProgress.Counter;
+import org.apache.hadoop.mapred.TaskStatus.Phase;
 import org.apache.hadoop.mapreduce.TaskType;
 import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.net.NetworkTopology;
 import org.apache.hadoop.net.Node;
+import org.apache.hadoop.net.TopologyCache;
 import org.apache.hadoop.util.StringUtils;
+
 
 public class CoronaJobInProgress extends JobInProgressTraits {
   static final Log LOG = LogFactory.getLog(CoronaJobInProgress.class);
@@ -54,17 +62,19 @@ public class CoronaJobInProgress extends JobInProgressTraits {
 
   @SuppressWarnings("deprecation")
   JobID jobId;
+  SessionPriority priority;
   JobProfile profile;
   JobStatus status;
+  private final JobStats jobStats = new JobStats();
   long startTime;
   long launchTime;
   long finishTime;
+  long deadline;
 
   String user;
   @SuppressWarnings("deprecation")
   JobConf jobConf;
 
-  Path systemDirForJob;  //  non-local
   Path jobFile;  // non-local
   Path localJobFile;
 
@@ -90,12 +100,12 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   private final boolean jobSetupCleanupNeeded;
   private final boolean jobFinishWhenReducesDone;
   private final boolean taskCleanupNeeded;
-  private boolean launchedSetup = false;
-  private boolean tasksInited = false;
-  private boolean reduceResourcesRequested = false;
-  private boolean launchedCleanup = false;
-  private boolean jobKilled = false;
-  private boolean jobFailed = false;
+  private volatile boolean launchedSetup = false;
+  private volatile boolean tasksInited = false;
+  private final AtomicBoolean reduceResourcesRequested = new AtomicBoolean(false);
+  private volatile boolean launchedCleanup = false;
+  private volatile boolean jobKilled = false;
+  private volatile boolean jobFailed = false;
 
   String[][] mapLocations;  // Has an array of locations for each map.
   List<TaskInProgress> nonRunningMaps;
@@ -115,6 +125,10 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   int rushReduceMaps = 5;
   float speculativeMapUnfininshedThreshold = 0.001F;
   float speculativeReduceUnfininshedThreshold = 0.001F;
+  float speculativeMapLogRateThreshold = 0.001F;
+  int speculativeMapLogNumThreshold = 3;
+  float speculativeReduceLogRateThreshold = 0.001F;
+  int speculativeReduceLogNumThreshold = 3;
 
   Set<TaskInProgress> runningMaps = new LinkedHashSet<TaskInProgress>();
   Set<TaskInProgress> runningReduces = new LinkedHashSet<TaskInProgress>();
@@ -123,55 +137,45 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   @SuppressWarnings("deprecation")
   List<TaskAttemptID> reduceCleanupTasks = new LinkedList<TaskAttemptID>();
 
-  TopologyCache topologyCache;
   int maxLevel;
   int anyCacheLevel;
-  Map<String, TaskInProgress> runningHostToTaskMap =
-    new HashMap<String, TaskInProgress>();
-
-  // Per-job counters
-  public static enum Counter {
-    NUM_FAILED_MAPS,
-    NUM_FAILED_REDUCES,
-    TOTAL_LAUNCHED_MAPS,
-    TOTAL_LAUNCHED_REDUCES,
-    OTHER_LOCAL_MAPS,
-    DATA_LOCAL_MAPS,
-    RACK_LOCAL_MAPS,
-    SLOTS_MILLIS_MAPS,
-    SLOTS_MILLIS_REDUCES,
-    SLOTS_MILLIS_REDUCES_COPY,
-    SLOTS_MILLIS_REDUCES_SORT,
-    SLOTS_MILLIS_REDUCES_REDUCE,
-    FALLOW_SLOTS_MILLIS_MAPS,
-    FALLOW_SLOTS_MILLIS_REDUCES,
-    LOCAL_MAP_INPUT_BYTES,
-    RACK_MAP_INPUT_BYTES
-  }
+  private final LocalityStats localityStats;
+  private final Thread localityStatsThread;
 
   // runningMapTasks include speculative tasks, so we need to capture
   // speculative tasks separately
   int speculativeMapTasks = 0;
   int speculativeReduceTasks = 0;
-  boolean garbageCollected = false;
-  private static AtomicInteger totalSpeculativeMapTasks = new AtomicInteger(0);
-  private static AtomicInteger totalSpeculativeReduceTasks =
-      new AtomicInteger(0);
 
   int mapFailuresPercent = 0;
   int reduceFailuresPercent = 0;
   @SuppressWarnings("deprecation")
   Counters jobCounters = new Counters();
-  
+
+  TaskErrorCollector taskErrorCollector;
+
   // Maximum no. of fetch-failure notifications after which
   // the map task is killed
   private static final int MAX_FETCH_FAILURES_NOTIFICATIONS = 3;
+  private static final int MAX_FETCH_FAILURES_PER_MAP_DEFAULT = 50;
+  private static final String MAX_FETCH_FAILURES_PER_MAP_KEY =
+     "mapred.job.per.map.maxfetchfailures";
+  private int maxFetchFailuresPerMapper;
+
+  // The key for the property holding the job deadline value
+  private static final String JOB_DEADLINE_KEY = "mapred.job.deadline";
+  // The default value of the job deadline property
+  private static final long JOB_DEADLINE_DEFAULT_VALUE = 0L;
+  // The key for the property holding the job priority
+  private static final String SESSION_PRIORITY_KEY = "mapred.job.priority";
+  // The default value of the job priority
+  private static final String SESSION_PRIORITY_DEFAULT = "NORMAL";
   // The maximum percentage of fetch failures allowed for a map
   private static final double MAX_ALLOWED_FETCH_FAILURES_PERCENT = 0.5;
   // Map of mapTaskId -> no. of fetch failures
-  private Map<TaskAttemptID, Integer> mapTaskIdToFetchFailuresMap =
+  private final Map<TaskAttemptID, Integer> mapTaskIdToFetchFailuresMap =
     new TreeMap<TaskAttemptID, Integer>();
-  
+
   // Don't lower speculativeCap below one TT's worth (for small clusters)
   private static final int MIN_SPEC_CAP = 10;
   public static final String SPECULATIVE_SLOWTASK_THRESHOLD =
@@ -186,6 +190,8 @@ public class CoronaJobInProgress extends JobInProgressTraits {
     "mapreduce.job.speculative.slownodethreshold";
   public static final String SPECULATIVE_REFRESH_TIMEOUT =
     "mapreduce.job.speculative.refresh.timeout";
+  public static final String LOG_CANNOTSPECULATIVE_INTERVAL =
+    "mapreduce.job.log.cannotspeculative.interval";
   public static final String SPECULATIVE_STDDEVMEANRATIO_MAX =
     "mapreduce.job.speculative.stddevmeanratio.max";
 
@@ -194,7 +200,9 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   float speculativeCap;
   float slowNodeThreshold;
   private long lastSpeculativeMapRefresh, lastSpeculativeReduceRefresh;
+  private long lastTimeCannotspeculativeMapLog, lastTimeCannotspeculativeReduceLog;
   private final long speculativeRefreshTimeout;
+  private final long logCannotspeculativeInterval;
   private final float speculativeStddevMeanRatioMax;
   volatile private boolean hasSpeculativeMaps;
   volatile private boolean hasSpeculativeReduces;
@@ -220,28 +228,40 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   private final DataStatistics runningMapTaskStats = new DataStatistics();
   //runningReduceStats used to maintain the RUNNING reduce tasks' statistics
   private final DataStatistics runningReduceTaskStats = new DataStatistics();
+  private static final String JOB_KILLED_REASON = "Job killed";
+  private static final String EMPTY_TRACKER_NAME =
+    "tracker_:localhost.localdomain/127.0.0.1:";
 
 
   protected CoronaJobTracker.TaskLookupTable taskLookupTable;
-  private final ResourceTracker resourceTracker;
+  private final TaskStateChangeListener taskStateChangeListener;
 
   private final Object lockObject;
   private final CoronaJobHistory jobHistory;
+  
+  private String jobTrackerId;
+
+  private int terminated = -1;
+
 
   @SuppressWarnings("deprecation")
   public CoronaJobInProgress(
     Object lockObject,
-    JobID jobId, Path systemDir, JobConf defaultConf,
+    JobID jobId, Path systemDir, JobConf jobConf,
     CoronaJobTracker.TaskLookupTable taskLookupTable,
-    ResourceTracker resourceTracker, CoronaJobHistory jobHistory, String url)
+    TaskStateChangeListener taskStateChangeListener,
+    TopologyCache topologyCache,
+    CoronaJobHistory jobHistory, String url, String jobTrackerId)
     throws IOException {
     this.lockObject = lockObject;
     this.clock = JobTracker.getClock();
 
     this.jobId = jobId;
+    this.jobConf = jobConf;
     this.taskLookupTable = taskLookupTable;
-    this.resourceTracker = resourceTracker;
+    this.taskStateChangeListener = taskStateChangeListener;
     this.jobHistory = jobHistory;
+    this.jobTrackerId = jobTrackerId;
 
     // Status.
     this.startTime = clock.getTime();
@@ -249,29 +269,13 @@ public class CoronaJobInProgress extends JobInProgressTraits {
     status.setStartTime(startTime);
 
     // Job file.
-    this.systemDirForJob = getJobSystemDir(systemDir, jobId);
-    this.jobFile = new Path(systemDirForJob, "job.xml");
-
-    JobConf cachedJobConf = JobClient.getAndRemoveCachedJobConf(jobId);
-    if (cachedJobConf == null) {
-      this.localJobFile = new Path("/tmp/" + jobId + ".xml"); // TODO
-      systemDirForJob.getFileSystem(defaultConf).
-      copyToLocalFile(jobFile, localJobFile);
-      LOG.info("Copied job file " + jobFile + " to local file " + localJobFile);
-
-      this.jobConf = new JobConf(localJobFile);
-    } else {
-      this.jobConf = cachedJobConf;
-    }
-
-    LOG.info("Split file: " + jobConf.get("mapred.job.split.file"));
+    this.jobFile = getJobFile(systemDir, jobId);
 
     this.user = jobConf.getUser();
     this.profile = new JobProfile(
       user, jobId, jobFile.toString(), url, jobConf.getJobName(),
       jobConf.getQueueName());
 
-    this.topologyCache = new TopologyCache(jobConf);
 
     this.numMapTasks = jobConf.getNumMapTasks();
     this.numReduceTasks = jobConf.getNumReduceTasks();
@@ -289,6 +293,15 @@ public class CoronaJobInProgress extends JobInProgressTraits {
     this.maxLevel = jobConf.getInt("mapred.task.cache.levels",
         NetworkTopology.DEFAULT_HOST_LEVEL);
     this.anyCacheLevel = this.maxLevel+1;
+    this.localityStats = new LocalityStats(
+      jobConf, maxLevel, jobCounters, jobStats, topologyCache);
+    localityStatsThread = new Thread(localityStats);
+    localityStatsThread.setName("Locality Stats");
+    localityStatsThread.setDaemon(true);
+    localityStatsThread.start();
+
+    this.taskErrorCollector = new TaskErrorCollector(
+      jobConf, Integer.MAX_VALUE, 1);
 
     this.slowTaskThreshold = Math.max(0.0f,
         jobConf.getFloat(CoronaJobInProgress.SPECULATIVE_SLOWTASK_THRESHOLD,1.0f));
@@ -298,6 +311,8 @@ public class CoronaJobInProgress extends JobInProgressTraits {
         CoronaJobInProgress.SPECULATIVE_SLOWNODE_THRESHOLD,1.0f);
     this.speculativeRefreshTimeout = jobConf.getLong(
         CoronaJobInProgress.SPECULATIVE_REFRESH_TIMEOUT, 5000L);
+    this.logCannotspeculativeInterval = jobConf.getLong(
+        CoronaJobInProgress.LOG_CANNOTSPECULATIVE_INTERVAL, 150000L);
     this.speculativeStddevMeanRatioMax = jobConf.getFloat(
         CoronaJobInProgress.SPECULATIVE_STDDEVMEANRATIO_MAX, 0.33f);
 
@@ -307,11 +322,20 @@ public class CoronaJobInProgress extends JobInProgressTraits {
     this.speculativeReduceUnfininshedThreshold = jobConf.getFloat(
         CoronaJobInProgress.SPECULATIVE_REDUCE_UNFINISHED_THRESHOLD_KEY,
         speculativeReduceUnfininshedThreshold);
+    this.deadline = jobConf.getLong(JOB_DEADLINE_KEY,
+        JOB_DEADLINE_DEFAULT_VALUE);
 
+
+    this.priority = SessionPriority.valueOf(
+        jobConf.get(SESSION_PRIORITY_KEY, SESSION_PRIORITY_DEFAULT));
     hasSpeculativeMaps = jobConf.getMapSpeculativeExecution();
     hasSpeculativeReduces = jobConf.getReduceSpeculativeExecution();
     LOG.info(jobId + ": hasSpeculativeMaps = " + hasSpeculativeMaps +
              ", hasSpeculativeReduces = " + hasSpeculativeReduces);
+  }
+
+  public JobStats getJobStats() {
+    return jobStats;
   }
 
   @Override
@@ -323,6 +347,14 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   public JobStatus getStatus() { return status; }
 
   public boolean isSetupCleanupRequired() { return jobSetupCleanupNeeded; }
+
+  public SessionPriority getPriority() {
+    return this.priority;
+  }
+  
+  public void setPriority(SessionPriority priority) {
+    this.priority = priority;
+  }
 
   @Override
   DataStatistics getRunningTaskStatistics(boolean isMap) {
@@ -348,6 +380,12 @@ public class CoronaJobInProgress extends JobInProgressTraits {
 
   public long getFinishTime() { return finishTime; }
 
+  public long getJobDeadline() { return deadline; }
+
+  public int getNumMapTasks() { return numMapTasks; }
+
+  public int getNumReduceTasks() { return numReduceTasks; }
+
   @SuppressWarnings("deprecation")
   public Counters getJobCounters() { return jobCounters; }
 
@@ -356,7 +394,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    */
   @SuppressWarnings("deprecation")
   public Counters getMapCounters() {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       return incrementTaskCountersUnprotected(new Counters(), maps);
     }
   }
@@ -366,14 +404,9 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    */
   @SuppressWarnings("deprecation")
   public Counters getReduceCounters() {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       return incrementTaskCountersUnprotected(new Counters(), reduces);
     }
-  }
-
-  public int getNoOfBlackListedTrackers() {
-    // TODO
-    return 0;
   }
 
   /**
@@ -382,31 +415,21 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   TaskInProgress[] getTasks(TaskType type) {
     TaskInProgress[] tasks = null;
     switch (type) {
-      case MAP:
-        {
-          tasks = maps;
-        }
-        break;
-      case REDUCE:
-        {
-          tasks = reduces;
-        }
-        break;
-      case JOB_SETUP:
-        {
-          tasks = setup;
-        }
-        break;
-      case JOB_CLEANUP:
-        {
-          tasks = cleanup;
-        }
-        break;
-      default:
-        {
-          tasks = new TaskInProgress[0];
-        }
-        break;
+    case MAP:
+      tasks = maps;
+      break;
+    case REDUCE:
+      tasks = reduces;
+      break;
+    case JOB_SETUP:
+      tasks = setup;
+      break;
+    case JOB_CLEANUP:
+      tasks = cleanup;
+      break;
+    default:
+      tasks = new TaskInProgress[0];
+      break;
     }
 
     return tasks;
@@ -415,7 +438,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   public TaskCompletionEvent[] getTaskCompletionEvents(
         int fromEventId, int maxEvents) {
     TaskCompletionEvent[] events = TaskCompletionEvent.EMPTY_ARRAY;
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       if (!tasksInited) {
         return events;
       }
@@ -430,15 +453,16 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   }
 
   public int getTaskCompletionEventsSize() {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       return taskCompletionEvents.size();
     }
   }
 
-  void fetchFailureNotification(
+  boolean fetchFailureNotification(
         TaskAttemptID reportingAttempt,
         TaskInProgress tip, TaskAttemptID mapAttemptId, String trackerName) {
-    synchronized(lockObject) {
+    jobStats.incNumMapFetchFailures();
+    synchronized (lockObject) {
       Integer fetchFailures = mapTaskIdToFetchFailuresMap.get(mapAttemptId);
       fetchFailures = (fetchFailures == null) ? 1 : (fetchFailures + 1);
       mapTaskIdToFetchFailuresMap.put(mapAttemptId, fetchFailures);
@@ -447,29 +471,47 @@ public class CoronaJobInProgress extends JobInProgressTraits {
 
       float failureRate = (float)fetchFailures / runningReduceTasks;
       // declare faulty if fetch-failures >= max-allowed-failures
-      final boolean isMapFaulty = (failureRate >= MAX_ALLOWED_FETCH_FAILURES_PERCENT);
+      final boolean isMapFaulty = (failureRate >= MAX_ALLOWED_FETCH_FAILURES_PERCENT) ||
+          fetchFailures > maxFetchFailuresPerMapper;
       if (fetchFailures >= MAX_FETCH_FAILURES_NOTIFICATIONS && isMapFaulty) {
-        String reason = "Too many fetch-failures (" + fetchFailures + ")";
+        String reason = "Too many fetch-failures (" + fetchFailures + ") at " +
+          new Date();
         LOG.info(reason + " for " + mapAttemptId + " ... killing it");
 
         final boolean isFailed = true;
-        TaskTrackerStatus ttStatus = null;
+        TaskTrackerInfo ttStatus = null;
+        jobStats.incNumMapTasksFailedByFetchFailures();
         failedTask(tip, mapAttemptId, reason,
             (tip.isMapTask() ? TaskStatus.Phase.MAP : TaskStatus.Phase.REDUCE),
             isFailed, trackerName, ttStatus);
 
         mapTaskIdToFetchFailuresMap.remove(mapAttemptId);
+        return true;
       }
     }
+    return false;
   }
 
   @SuppressWarnings("deprecation")
-  public static Path getJobSystemDir(Path systemDir, JobID jobId) {
-    return new Path(systemDir, jobId.toString());
+  public static Path getJobFile(Path systemDir, JobID jobId) {
+    Path systemDirForJob = new Path(systemDir, jobId.toString());
+    return new Path(systemDirForJob, "job.xml");
   }
 
   public int getMaxTasksPerJob() {
     return 0; // No maximum.
+  }
+
+  public void close() {
+    localityStats.stop();
+    localityStatsThread.interrupt();
+    // The thread may be stuck in DNS lookups. This thread is a daemon,
+    // so it will not prevent process exit.
+    try {
+      localityStatsThread.join(1000);
+    } catch (InterruptedException e) {
+      LOG.warn("localityStatsThread.join interrupted");
+    }
   }
 
   /**
@@ -477,18 +519,19 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    */
   public void initTasks() throws IOException {
     // log job info
-    jobHistory.logSubmitted(jobFile.toString(), this.startTime);
+    jobHistory.logSubmitted(jobFile.toString(), this.startTime, this.jobTrackerId);
     // log the job priority
     JobClient.RawSplit[] splits = null;
     splits = JobClient.getAndRemoveCachedSplits(jobId);
     if (splits == null) {
-      FileSystem fs = systemDirForJob.getFileSystem(jobConf);
-      DataInputStream splitFile =
-        fs.open(new Path(jobConf.get("mapred.job.split.file")));
+      FileSystem fs = jobFile.getFileSystem(jobConf);
+      Path splitFile = new Path(jobFile.getParent(), "job.split");
+      LOG.info("Reading splits from " + splitFile);
+      DataInputStream splitFileIn = fs.open(splitFile);
       try {
-        splits = JobClient.readSplitFile(splitFile);
+        splits = JobClient.readSplitFile(splitFileIn);
       } finally {
-        splitFile.close();
+        splitFileIn.close();
       }
     }
     initTasksFromSplits(splits);
@@ -500,7 +543,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    * Used by test code.
    */
   void initTasksFromSplits(JobClient.RawSplit[] splits) throws IOException {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       initTasksFromSplitsUnprotected(splits);
     }
   }
@@ -527,7 +570,6 @@ public class CoronaJobInProgress extends JobInProgressTraits {
                                  jobConf, this, i, 1); // numSlotsPerMap = 1
       nonRunningMaps.add(maps[i]);
       mapLocations[i] = splits[i].getLocations();
-      resourceTracker.addNewMapTask(maps[i]);
     }
     LOG.info("Input size for job " + jobId + " = " + inputLength
         + ". Number of splits = " + splits.length);
@@ -557,7 +599,8 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       jobConf.getInt(RUSH_REDUCER_MAP_THRESHOLD, rushReduceMaps);
     rushReduceReduces =
       jobConf.getInt(RUSH_REDUCER_REDUCE_THRESHOLD, rushReduceReduces);
-    requestReduceResourcesUnprotected();
+    maxFetchFailuresPerMapper = jobConf.getInt(MAX_FETCH_FAILURES_PER_MAP_KEY,
+      MAX_FETCH_FAILURES_PER_MAP_DEFAULT);
 
     // Proceed to Setup/Cleanup.
     if (jobSetupCleanupNeeded) {
@@ -602,23 +645,28 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   }
 
   /**
-   * Request reduce resources if enough maps have finished.
+   * Signals that the reduce resources are being requested
+   * as soon as one process starts this nobody else should be
+   * trying to request reduce resources, so get current and set to true
+   *
+   * @return false if the resources have not been requested yet,
+   * true if they have
    */
-  void requestReduceResourcesUnprotected() {
-    if (reduceResourcesRequested || !scheduleReducesUnprotected()) {
-      return;
-    }
-    LOG.info("Requesting reduce resources after finishing " +
-      finishedMapTasks + " maps");
-    reduceResourcesRequested = true;
-    for (int i = 0; i < reduces.length; i++) {
-      resourceTracker.addNewReduceTask(reduces[i]);
-    }
+  boolean initializeReducers() {
+    return this.reduceResourcesRequested.getAndSet(true);
   }
 
+  boolean areReducersInitialized() {
+    return this.reduceResourcesRequested.get();
+  }
   public Task obtainNewMapTaskForTip(
       String taskTrackerName, String hostName, TaskInProgress intendedTip) {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
+      Task result = obtainTaskCleanupTask(taskTrackerName, intendedTip);
+      if (result != null) {
+        return result;
+      }
+
       if (status.getRunState() != JobStatus.RUNNING) {
         return null;
       }
@@ -651,7 +699,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       }
       scheduleMapUnprotected(tip);
 
-      Task result = tip.getTaskToRun(taskTrackerName);
+      result = tip.getTaskToRun(taskTrackerName);
       if (result != null) {
         addRunningTaskToTIPUnprotected(tip, result.getTaskID(),
             taskTrackerName, hostName, true);
@@ -659,29 +707,43 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       return result;
     }
   }
+  
+  /**
+   * Registers new task attempt for given task
+   * @param taskTrackerName name of destination tracker
+   * @param hostName hostname of tracker
+   * @param forcedTip task in progress to run
+   * @return task to run
+   */
+  public Task forceNewMapTaskForTip(String taskTrackerName, String hostName,
+      TaskInProgress forcedTip) {
+    synchronized (lockObject) {
+      Task result = obtainTaskCleanupTask(taskTrackerName, forcedTip);
+      if (result != null) {
+        return result;
+      }
+
+      removeMatchingTipUnprotectedUnconditional(nonRunningMaps, forcedTip);
+      LOG.info("Running task " + forcedTip.getTIPId() + " on "
+          + taskTrackerName + "(" + hostName + ")");
+      scheduleMapUnprotected(forcedTip);
+      result = forcedTip.getTaskToRun(taskTrackerName);
+      if (result != null) {
+        addRunningTaskToTIPUnprotected(forcedTip, result.getTaskID(),
+            taskTrackerName, hostName, true);
+        // Handle cleanup task
+        setJobCleanupTaskState(result);
+      }
+      return result;
+    }
+  }
+
 
   @Override
   public boolean hasSpeculativeMaps() { return hasSpeculativeMaps; }
 
   @Override
   public boolean hasSpeculativeReduces() { return hasSpeculativeReduces; }
-
-  public int getSpeculativeCap(TaskType type) {
-    int cap = 0;
-    synchronized(lockObject) {
-      int numRunningTasks = (type == TaskType.MAP) ?
-          (runningMapTasks - speculativeMapTasks) :
-            (runningReduceTasks - speculativeReduceTasks);
-      int numCompletedTasks = (type == TaskType.MAP) ?
-              finishedMapTasks : finishedReduceTasks;
-      cap = Math.max(
-              MIN_SPEC_CAP,
-              (int) (speculativeCap * Math.max(numRunningTasks, numCompletedTasks)));
-    }
-    int maxResources = resourceTracker.maxGrantedResources(type == TaskType.MAP);
-    cap = Math.max(cap, (int) (speculativeCap * maxResources));
-    return cap;
-  }
 
   private void refreshCandidateSpeculativeMapsUnprotected() {
     long now = clock.getTime();
@@ -690,60 +752,45 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       for(TaskInProgress tip: runningMaps) {
         tip.updateProgressRate(now);
       }
+      candidateSpeculativeMaps =
+        findSpeculativeTaskCandidatesUnprotected(runningMaps);
 
-      candidateSpeculativeMaps = findSpeculativeTaskCandidatesUnprotected(runningMaps);
+      int cap = getSpeculativeCap(TaskType.MAP);
+      cap = Math.max(0, cap - speculativeMapTasks);
+      cap = Math.min(candidateSpeculativeMaps.size(), cap);
+      candidateSpeculativeMaps = candidateSpeculativeMaps.subList(0, cap);
       lastSpeculativeMapRefresh = now;
     }
   }
 
-  public void updateSpeculationRequests() {
-    synchronized(lockObject) {
+  public int getSpeculativeCap(TaskType type) {
+    int cap = 0;
+    synchronized (lockObject) {
+      int numRunningTasks = (type == TaskType.MAP) ?
+          (runningMapTasks - speculativeMapTasks) :
+            (runningReduceTasks - speculativeReduceTasks);
+      cap = (int) Math.max(MIN_SPEC_CAP, speculativeCap * numRunningTasks);
+    }
+    return cap;
+  }
+
+  public List<TaskInProgress> getSpeculativeCandidates(TaskType type) {
+    synchronized (lockObject) {
+      if (TaskType.MAP == type) {
+        return candidateSpeculativeMaps;
+      } else {
+        return candidateSpeculativeReduces;
+      }
+    }
+  }
+
+  public void updateSpeculationCandidates() {
+    synchronized (lockObject) {
       if (hasSpeculativeMaps()) {
         refreshCandidateSpeculativeMapsUnprotected();
       }
       if (hasSpeculativeReduces()) {
         refreshCandidateSpeculativeReducesUnprotected();
-      }
-
-      long now = clock.getTime();
-      List<TaskInProgress> currentSpeculativeTasks =
-        resourceTracker.tasksBeingSpeculated();
-      // If a speculative TIP becomes un-speculatable, say because of sudden
-      // progress change, remove any ungranted requests. This lets us
-      // speculate TIPs in genuine need.
-      for (TaskInProgress tip: currentSpeculativeTasks) {
-        if (!tip.canBeSpeculated(now)) {
-          List<Integer> grantsInUse = new ArrayList<Integer>();
-          for (TaskAttemptID attempt: tip.getAllTaskAttemptIDs()) {
-            Integer grantIdInUse = taskLookupTable.getGrantIdForTask(attempt);
-            if (grantIdInUse != null) {
-              grantsInUse.add(grantIdInUse);
-            }
-          }
-          resourceTracker.releaseSpeculativeRequests(tip, grantsInUse);
-        }
-      }
-
-      for (TaskType type: new TaskType[]{TaskType.MAP, TaskType.REDUCE}) {
-        List<TaskInProgress> candidates = type == TaskType.MAP ?
-            candidateSpeculativeMaps : candidateSpeculativeReduces;
-        if (candidates != null) {
-          int cap = getSpeculativeCap(type);
-          int numSpeculative = resourceTracker.numSpeculativeRequests(
-            type == TaskType.MAP ? ResourceTracker.RESOURCE_TYPE_MAP :
-              ResourceTracker.RESOURCE_TYPE_REDUCE);
-          cap = Math.max(0, cap - numSpeculative);
-
-          for (TaskInProgress task: candidates) {
-            if (!task.canBeSpeculated(now))
-              continue;
-            if (cap == 0) {
-              break;
-            }
-            int numRequested = resourceTracker.speculateTask(task);
-            cap = Math.max(0, cap - numRequested);
-          }
-        }
       }
     }
   }
@@ -779,6 +826,38 @@ public class CoronaJobInProgress extends JobInProgressTraits {
     HAS_RUN_ON_MACHINE,
     MACHINE_IS_SLOW
   };
+
+  public boolean confirmSpeculativeTask(TaskInProgress tip,
+      String taskTrackerName, String taskTrackerHost) {
+    synchronized (lockObject) {
+      if (tip.isMapTask()) {
+        return confirmSpeculativeTaskUnprotected(candidateSpeculativeMaps,
+            tip, taskTrackerName, taskTrackerHost, TaskType.MAP)
+            == SpeculationStatus.CAN_BE_SPECULATED;
+      } else {
+        return confirmSpeculativeTaskUnprotected(candidateSpeculativeReduces,
+            tip, taskTrackerName, taskTrackerHost, TaskType.REDUCE)
+            == SpeculationStatus.CAN_BE_SPECULATED;
+      }
+    }
+  }
+
+  public boolean isBadSpeculativeResource(TaskInProgress tip,
+      String taskTrackerName, String taskTrackerHost) {
+    synchronized (lockObject) {
+      SpeculationStatus status = null;
+      if (tip.isMapTask()) {
+        status = confirmSpeculativeTaskUnprotected(candidateSpeculativeMaps,
+            tip, taskTrackerName, taskTrackerHost, TaskType.MAP);
+
+      } else {
+        status = confirmSpeculativeTaskUnprotected(candidateSpeculativeReduces,
+            tip, taskTrackerName, taskTrackerHost, TaskType.REDUCE);
+      }
+      return status == SpeculationStatus.HAS_RUN_ON_MACHINE ||
+      status == SpeculationStatus.MACHINE_IS_SLOW;
+    }
+  }
 
   protected SpeculationStatus confirmSpeculativeTaskUnprotected(
       List<TaskInProgress> candidates, TaskInProgress intendedTip,
@@ -840,6 +919,24 @@ public class CoronaJobInProgress extends JobInProgressTraits {
     }
     return null;
   }
+  
+  /**
+   * Removes matching TIP without checking any conditions
+   * @param taskList list of tasks to remove from
+   * @param intendedTip tip to remove
+   * @return removed tip
+   */
+  private TaskInProgress removeMatchingTipUnprotectedUnconditional(
+      List<TaskInProgress> taskList, TaskInProgress intendedTip) {
+    for (Iterator<TaskInProgress> iter = taskList.iterator(); iter.hasNext();) {
+      TaskInProgress t = iter.next();
+      if (t.getTIPId().equals(intendedTip.getTIPId())) {
+        iter.remove();
+        return t;
+      }
+    }
+    return null;
+  }
 
   /**
    * Find a non-running task in the passed list of TIPs
@@ -884,9 +981,12 @@ public class CoronaJobInProgress extends JobInProgressTraits {
 
   public Task obtainNewReduceTaskForTip(String taskTrackerName, String hostName,
       TaskInProgress intendedTip) {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       // TODO: check for resource constraints.
-
+      Task result = obtainTaskCleanupTask(taskTrackerName, intendedTip);
+      if (result != null) {
+        return result;
+      }
       TaskInProgress tip = removeMatchingTipUnprotected(
           nonRunningReduces, hostName, intendedTip);
       if (tip != null) {
@@ -916,7 +1016,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       }
 
       scheduleReduceUnprotected(tip);
-      Task result = tip.getTaskToRun(taskTrackerName);
+      result = tip.getTaskToRun(taskTrackerName);
       if (result != null) {
         addRunningTaskToTIPUnprotected(
             tip, result.getTaskID(), taskTrackerName, hostName, true);
@@ -924,19 +1024,35 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       return result;
     }
   }
-
-  // returns the (cache)level at which the nodes matches
-  private int getMatchingLevelForNodes(Node n1, Node n2) {
-    int count = 0;
-    do {
-      if (n1.equals(n2)) {
-        return count;
+  
+  /**
+   * Registers new task attempt for given task
+   * @param taskTrackerName name of destination tracker
+   * @param hostName hostname of tracker
+   * @param forcedTip task in progress to run
+   * @return task to run
+   */
+  public Task forceNewReduceTaskForTip(String taskTrackerName, String hostName,
+      TaskInProgress forcedTip) {
+    synchronized (lockObject) {
+      Task result = obtainTaskCleanupTask(taskTrackerName, forcedTip);
+      if (result != null) {
+        return result;
       }
-      ++count;
-      n1 = n1.getParent();
-      n2 = n2.getParent();
-    } while (n1 != null && n2 != null);
-    return this.maxLevel;
+
+      removeMatchingTipUnprotectedUnconditional(nonRunningMaps, forcedTip);
+      LOG.info("Running task " + forcedTip.getTIPId() + " on "
+          + taskTrackerName + "(" + hostName + ")");
+      scheduleReduceUnprotected(forcedTip);
+      result = forcedTip.getTaskToRun(taskTrackerName);
+      if (result != null) {
+        addRunningTaskToTIPUnprotected(forcedTip, result.getTaskID(),
+            taskTrackerName, hostName, true);
+        // Handle cleanup task
+        setJobCleanupTaskState(result);
+      }
+      return result;
+    }
   }
 
   private void refreshCandidateSpeculativeReducesUnprotected() {
@@ -946,15 +1062,15 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       for(TaskInProgress tip: runningReduces) {
         tip.updateProgressRate(now);
       }
-      candidateSpeculativeReduces = findSpeculativeTaskCandidatesUnprotected(runningReduces);
+      candidateSpeculativeReduces =
+        findSpeculativeTaskCandidatesUnprotected(runningReduces);
+      int cap = getSpeculativeCap(TaskType.REDUCE);
+      cap = Math.max(0, cap - speculativeReduceTasks);
+      cap = Math.min(candidateSpeculativeReduces.size(), cap);
+      candidateSpeculativeReduces =
+        candidateSpeculativeReduces.subList(0, cap);
       lastSpeculativeReduceRefresh = now;
     }
-  }
-
-
-  private boolean shouldRunOnTaskTracker(String taskTracker) {
-    // TODO: need blacklisting and cluster size for this.
-    return true;
   }
 
   /**
@@ -962,9 +1078,8 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    */
   public boolean canTrackerBeUsed(
       String taskTracker, String trackerHost, TaskInProgress tip) {
-    synchronized(lockObject) {
-      return shouldRunOnTaskTracker(taskTracker) &&
-      !tip.hasFailedOnMachine(trackerHost);
+    synchronized (lockObject) {
+      return !tip.hasFailedOnMachine(trackerHost);
     }
   }
 
@@ -973,7 +1088,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    */
   public Task obtainJobCleanupTask(
       String taskTrackerName, String hostName, boolean isMapSlot) {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       if(!tasksInited || !jobSetupCleanupNeeded) {
         return null;
       }
@@ -1000,24 +1115,54 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       if (result != null) {
         addRunningTaskToTIPUnprotected(tip, result.getTaskID(), taskTrackerName, hostName,
             true);
-        if (jobFailed) {
-          result.setJobCleanupTaskState
-          (org.apache.hadoop.mapreduce.JobStatus.State.FAILED);
-        } else if (jobKilled) {
-          result.setJobCleanupTaskState
-          (org.apache.hadoop.mapreduce.JobStatus.State.KILLED);
-        } else {
-          result.setJobCleanupTaskState
-          (org.apache.hadoop.mapreduce.JobStatus.State.SUCCEEDED);
-        }
+        // Handle cleanup task
+        setJobCleanupTaskState(result);
       }
       return result;
     }
   }
+  
+  /**
+   * Sets task state according to job state if given task is cleanup one
+   * @param task task to handle
+   */
+  private void setJobCleanupTaskState(Task task) {
+    if (task.isJobCleanupTask()) {
+      if (jobFailed) {
+        task.setJobCleanupTaskState(
+            org.apache.hadoop.mapreduce.JobStatus.State.FAILED);
+      } else if (jobKilled) {
+        task.setJobCleanupTaskState(
+            org.apache.hadoop.mapreduce.JobStatus.State.KILLED);
+      } else {
+        task.setJobCleanupTaskState(
+            org.apache.hadoop.mapreduce.JobStatus.State.SUCCEEDED);
+      }
+    }
+  }
+ 
+  @SuppressWarnings("deprecation")
+  public boolean needsTaskCleanup(TaskInProgress tip) {
+    synchronized (lockObject) {
+      Iterator<TaskAttemptID> cleanupCandidates;
+      if (tip.isMapTask()) {
+        cleanupCandidates = mapCleanupTasks.iterator();
+      } else {
+        cleanupCandidates = reduceCleanupTasks.iterator();
+      }
+      
+      while (cleanupCandidates.hasNext()) {
+        if (cleanupCandidates.next().getTaskID().equals(tip.getTIPId())) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
 
   @SuppressWarnings("deprecation")
-  public Task obtainTaskCleanupTask(String taskTracker, boolean isMapSlot) {
-    synchronized(lockObject) {
+  public Task obtainTaskCleanupTask(String taskTracker, TaskInProgress tip) {
+    synchronized (lockObject) {
       if (!tasksInited) {
         return null;
       }
@@ -1026,7 +1171,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
         return null;
       }
 
-      if (isMapSlot) {
+      if (tip.isMapTask()) {
         if (mapCleanupTasks.isEmpty())
           return null;
       } else {
@@ -1038,23 +1183,30 @@ public class CoronaJobInProgress extends JobInProgressTraits {
           jobFailed || jobKilled) {
         return null;
       }
-      if (!shouldRunOnTaskTracker(taskTracker)) {
-        return null;
-      }
       TaskAttemptID taskid = null;
-      TaskInProgress tip = null;
-      if (isMapSlot) {
+      Iterator<TaskAttemptID> cleanupCandidates = null;
+      boolean foundCleanup = false;
+      if (tip.isMapTask()) {
         if (!mapCleanupTasks.isEmpty()) {
-          taskid = mapCleanupTasks.remove(0);
-          tip = maps[taskid.getTaskID().getId()];
+          cleanupCandidates = mapCleanupTasks.iterator();
         }
       } else {
         if (!reduceCleanupTasks.isEmpty()) {
-          taskid = reduceCleanupTasks.remove(0);
-          tip = reduces[taskid.getTaskID().getId()];
+          cleanupCandidates = reduceCleanupTasks.iterator();
         }
       }
-      if (tip != null) {
+      
+      while (cleanupCandidates.hasNext()) {
+         taskid = cleanupCandidates.next();
+        
+        if (taskid.getTaskID().equals(tip.getTIPId())) {
+          // The task requires a cleanup so we are going to do that right now
+          cleanupCandidates.remove();
+          foundCleanup = true;
+          break;
+        }
+      }
+      if (foundCleanup) {
         return tip.addRunningTask(taskid, taskTracker, true);
       }
       return null;
@@ -1066,7 +1218,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    */
   public Task obtainJobSetupTask(
       String taskTrackerName, String hostName, boolean isMapSlot) {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       if (!tasksInited || !jobSetupCleanupNeeded) {
         return null;
       }
@@ -1097,22 +1249,75 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   }
 
   public void updateTaskStatus(TaskInProgress tip, TaskStatus status,
-      TaskTrackerStatus ttStatus) {
-    synchronized(lockObject) {
+      TaskTrackerInfo ttStatus) {
+    synchronized (lockObject) {
       updateTaskStatusUnprotected(tip, status, ttStatus);
     }
   }
-
+  
+  private boolean isTaskKilledHighMemory(TaskStatus status, String keyword) {
+    String diagnosticInfo = status.getDiagnosticInfo();
+    if (diagnosticInfo == null) {
+      return false;
+    }
+    String[] splitdiagnosticInfo = diagnosticInfo.split("\\s+");
+    for (String info : splitdiagnosticInfo) { 
+      if (keyword.equals(info)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  
+  private boolean isTaskKilledWithHighMemory(TaskStatus status) {
+    return isTaskKilledHighMemory(status,
+      TaskMemoryManagerThread.HIGH_MEMORY_KEYWORD);
+  }
+  
+  private boolean isTaskKilledWithCGroupMemory(TaskStatus status) {
+    return isTaskKilledHighMemory(status,
+      CGroupMemoryWatcher.CGROUPHIGH_MEMORY_KEYWORD);
+  }
+  
+  private void updateCGResourceCounters(TaskStatus status, boolean isMap) {
+    Counters taskCounters = status.getCounters();
+    long maxMem = taskCounters.getCounter(Task.Counter.MAX_MEMORY_BYTES);
+    long rssMem = taskCounters.getCounter(Task.Counter.MAX_RSS_MEMORY_BYTES);
+    long instMem = taskCounters.getCounter(Task.Counter.INST_MEMORY_BYTES);
+    
+    if (isMap) {
+     if (jobCounters.getCounter(Counter.MAX_MAP_MEM_BYTES) < maxMem) {
+       jobCounters.findCounter(Counter.MAX_MAP_MEM_BYTES).setValue(maxMem);
+     }
+     if (jobCounters.getCounter(Counter.MAX_MAP_RSS_MEM_BYTES) < rssMem) {
+       jobCounters.findCounter(Counter.MAX_MAP_RSS_MEM_BYTES).setValue(rssMem);
+     }
+     if (jobCounters.getCounter(Counter.MAX_MAP_INST_MEM_BYTES) < instMem) {
+       jobCounters.findCounter(Counter.MAX_MAP_INST_MEM_BYTES).setValue(instMem);
+     }
+    } else {
+      if (jobCounters.getCounter(Counter.MAX_REDUCE_MEM_BYTES) < maxMem) {
+        jobCounters.findCounter(Counter.MAX_REDUCE_MEM_BYTES).setValue(maxMem);
+      }
+      if (jobCounters.getCounter(Counter.MAX_REDUCE_RSS_MEM_BYTES) < rssMem) {
+        jobCounters.findCounter(Counter.MAX_REDUCE_RSS_MEM_BYTES).setValue(rssMem);
+      }
+      if (jobCounters.getCounter(Counter.MAX_REDUCE_INST_MEM_BYTES) < instMem) {
+        jobCounters.findCounter(Counter.MAX_REDUCE_INST_MEM_BYTES).setValue(instMem);
+      }
+    }
+  }
+  
   @SuppressWarnings("deprecation")
   private void updateTaskStatusUnprotected(TaskInProgress tip, TaskStatus status,
-      TaskTrackerStatus ttStatus) {
+      TaskTrackerInfo ttStatus) {
     double oldProgress = tip.getProgress();   // save old progress
     boolean wasRunning = tip.isRunning();
     boolean wasComplete = tip.isComplete();
     boolean wasPending = tip.isOnlyCommitPending();
     TaskAttemptID taskid = status.getTaskID();
     boolean wasAttemptRunning = tip.isAttemptRunning(taskid);
-
+    
     // If the TIP is already completed and the task reports as SUCCEEDED then
     // mark the task as KILLED.
     // In case of task with no promotion the task tracker will mark the task
@@ -1137,7 +1342,10 @@ public class CoronaJobInProgress extends JobInProgressTraits {
         status.setRunState(TaskStatus.State.KILLED);
       }
     }
-
+    
+    // aggregate the task tracker reported cgroup resource counters in job
+    updateCGResourceCounters(status, tip.isMapTask());
+    
     boolean change = tip.updateStatus(status);
     if (change) {
       TaskStatus.State state = status.getRunState();
@@ -1182,10 +1390,41 @@ public class CoronaJobInProgress extends JobInProgressTraits {
         } else {
           reduceCleanupTasks.add(taskid);
         }
+        if (isTaskKilledWithCGroupMemory(status)) {
+          //Increment the High Memory killed count for Reduce and Map Tasks
+          if (status.getIsMap()) {
+            jobCounters.incrCounter(
+              Counter.TOTAL_CGROUP_MEMORY_MAP_TASK_KILLED, 1);
+          }
+          else {
+            jobCounters.incrCounter(
+              Counter.TOTAL_CGROUP_MEMORY_REDUCE_TASK_KILLED, 1);
+          }
+        }
       }
       //For a failed task update the JT datastructures.
       else if (state == TaskStatus.State.FAILED ||
                state == TaskStatus.State.KILLED) {
+        if (isTaskKilledWithHighMemory(status)) {
+          //Increment the High Memory killed count for Reduce and Map Tasks
+          if (status.getIsMap()) {
+            jobCounters.incrCounter(Counter.TOTAL_HIGH_MEMORY_MAP_TASK_KILLED, 1);
+          }
+          else {
+            jobCounters.incrCounter(Counter.TOTAL_HIGH_MEMORY_REDUCE_TASK_KILLED, 1);
+          }
+        }
+        if (isTaskKilledWithCGroupMemory(status)) {
+          //Increment the High Memory killed count for Reduce and Map Tasks
+          if (status.getIsMap()) {
+            jobCounters.incrCounter(
+              Counter.TOTAL_CGROUP_MEMORY_MAP_TASK_KILLED, 1);
+          }
+          else {
+            jobCounters.incrCounter(
+              Counter.TOTAL_CGROUP_MEMORY_REDUCE_TASK_KILLED, 1);
+          }
+        }
         // Get the event number for the (possibly) previously successful
         // task. If there exists one, then set that status to OBSOLETE
         int eventNumber;
@@ -1232,7 +1471,8 @@ public class CoronaJobInProgress extends JobInProgressTraits {
           completedTask(tip, status, ttStatus);
         }
       }
-      processTaskResource(state, tip, taskid);
+      taskStateChangeListener.taskStateChange(state, tip, taskid,
+          (ttStatus == null ? "null" : ttStatus.getHost()));
     }
 
     //
@@ -1255,46 +1495,16 @@ public class CoronaJobInProgress extends JobInProgressTraits {
     }
   }
 
-  private void processTaskResource(TaskStatus.State state,
-      TaskInProgress tip, TaskAttemptID taskid) {
-    if (!TaskStatus.TERMINATING_STATES.contains(state)) {
-      return;
-    }
-    Integer grant = taskLookupTable.getGrantIdForTask(taskid);
-    taskLookupTable.removeTaskEntry(taskid);
-    if (state == TaskStatus.State.SUCCEEDED || !tip.isRunnable()) {
-      assert (grant != null) : "Grant for task id " + taskid + " is null!";
-      if (shouldReuseTaskResource(tip)) {
-        resourceTracker.reuseGrant(grant);
-      } else {
-        resourceTracker.taskDone(tip);
-      }
-    } else {
-      if (tip.isRunnable()) {
-        if (grant == null) {
-          // grant could be null if the task reached a terminating state twice,
-          // e.g. succeeded then failed due to a fetch failure. Or if a TT
-          // dies after after a success
-          if (tip.isMapTask()) {
-            resourceTracker.addNewMapTask(tip);
-          } else {
-            resourceTracker.addNewReduceTask(tip);
-          }
-          
-        } else {
-          resourceTracker.releaseAndRequestAnotherResource(grant);
-        }
-      } 
-    }
-  }
 
   /**
    * Should we reuse the resource of this succeeded task attempt
    * return true if we should reuse
    */
-  private boolean shouldReuseTaskResource(TaskInProgress tip) {
-    return tip.isJobCleanupTask() || tip.isJobSetupTask()
-        || canLaunchJobCleanupTaskUnprotected();
+  boolean shouldReuseTaskResource(TaskInProgress tip) {
+    synchronized (lockObject) {
+      return tip.isJobSetupTask() || canLaunchJobCleanupTaskUnprotected()
+          || tip.isJobCleanupTask();
+    }
     // TIP is a job setup/cleanup task or job is ready for cleanup.
     //
     // Since job setup/cleanup does not get an explicit resource, reuse
@@ -1305,8 +1515,8 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   }
 
   public boolean completedTask(TaskInProgress tip, TaskStatus status,
-      TaskTrackerStatus ttStatus) {
-    synchronized(lockObject) {
+      TaskTrackerInfo ttStatus) {
+    synchronized (lockObject) {
       return completedTaskUnprotected(tip, status, ttStatus);
     }
   }
@@ -1316,7 +1526,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    */
   @SuppressWarnings("deprecation")
   private boolean completedTaskUnprotected(TaskInProgress tip, TaskStatus status,
-      TaskTrackerStatus ttStatus) {
+      TaskTrackerInfo ttStatus) {
     int oldNumAttempts = tip.getActiveTasks().size();
     // Metering
     meterTaskAttemptUnprotected(tip, status);
@@ -1339,7 +1549,6 @@ public class CoronaJobInProgress extends JobInProgressTraits {
     tip.completed(taskId);
 
     // Update jobhistory
-    String trackerHostname = topologyCache.getNode(ttStatus.getHost()).toString();
     String taskType = getTaskType(tip);
     if (status.getIsMap()){
       jobHistory.logMapTaskStarted(status.getTaskID(), status.getStartTime(),
@@ -1347,7 +1556,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
                                        ttStatus.getHttpPort(),
                                        taskType);
       jobHistory.logMapTaskFinished(status.getTaskID(), status.getFinishTime(),
-                                        trackerHostname, taskType,
+                                        ttStatus.getHost(), taskType,
                                         status.getStateString(),
                                         status.getCounters());
     }else{
@@ -1357,7 +1566,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
                                           taskType);
       jobHistory.logReduceTaskFinished(status.getTaskID(), status.getShuffleFinishTime(),
                                            status.getSortFinishTime(), status.getFinishTime(),
-                                           trackerHostname,
+                                           ttStatus.getHost(),
                                            taskType,
                                            status.getStateString(),
                                            status.getCounters());
@@ -1391,32 +1600,20 @@ public class CoronaJobInProgress extends JobInProgressTraits {
     } else if (tip.isMapTask()) {
       runningMapTasks--;
       // Update locality counters.
-      int level = getLocalityLevel(tip, ttStatus);
       long inputBytes = tip.getCounters()
                 .getGroup("org.apache.hadoop.mapred.Task$Counter")
                 .getCounter("Map input bytes");
-      switch (level) {
-      case 0: jobCounters.incrCounter(Counter.LOCAL_MAP_INPUT_BYTES,
-                inputBytes);
-              break;
-      case 1: jobCounters.incrCounter(Counter.RACK_MAP_INPUT_BYTES,
-                inputBytes);
-              break;
-      default:
-              break;
-      }
-      // check if this was a sepculative task
+      jobStats.incTotalMapInputBytes(inputBytes);
+      localityStats.record(tip, ttStatus.getHost(), inputBytes);
+      // check if this was a speculative task.
       if (oldNumAttempts > 1) {
         speculativeMapTasks -= (oldNumAttempts - newNumAttempts);
-        if (!garbageCollected) {
-          totalSpeculativeMapTasks.addAndGet(newNumAttempts - oldNumAttempts);
-        }
+        jobStats.incNumSpeculativeSucceededMaps();
       }
       finishedMapTasks += 1;
-      if (!garbageCollected) {
-        if (!tip.isJobSetupTask() && hasSpeculativeMaps) {
-          updateTaskTrackerStats(tip,ttStatus,trackerMapStats,mapTaskStats);
-        }
+      jobStats.incNumMapTasksCompleted();
+      if (!tip.isJobSetupTask() && hasSpeculativeMaps) {
+        updateTaskTrackerStats(tip,ttStatus,trackerMapStats,mapTaskStats);
       }
       // remove the completed map from the resp running caches
       retireMapUnprotected(tip);
@@ -1427,15 +1624,12 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       runningReduceTasks -= 1;
       if (oldNumAttempts > 1) {
         speculativeReduceTasks -= (oldNumAttempts - newNumAttempts);
-        if (!garbageCollected) {
-          totalSpeculativeReduceTasks.addAndGet(newNumAttempts - oldNumAttempts);
-        }
+        jobStats.incNumSpeculativeSucceededReduces();
       }
       finishedReduceTasks += 1;
-      if (!garbageCollected) {
-        if (!tip.isJobSetupTask() && hasSpeculativeReduces) {
-          updateTaskTrackerStats(tip,ttStatus,trackerReduceStats,reduceTaskStats);
-        }
+      jobStats.incNumReduceTasksCompleted();
+      if (!tip.isJobSetupTask() && hasSpeculativeReduces) {
+        updateTaskTrackerStats(tip,ttStatus,trackerReduceStats,reduceTaskStats);
       }
       // remove the completed reduces from the running reducers set
       retireReduceUnprotected(tip);
@@ -1449,7 +1643,6 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       jobCompleteUnprotected();
     }
 
-    requestReduceResourcesUnprotected();
     return true;
   }
 
@@ -1457,10 +1650,16 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    * Fail a task with a given reason, but without a status object.
    */
   @SuppressWarnings("deprecation")
-  public void failedTask(TaskInProgress tip, TaskAttemptID taskid, String reason,
-                         TaskStatus.Phase phase, boolean isFailed,
-                         String trackerName, TaskTrackerStatus ttStatus) {
-    TaskStatus.State state = isFailed ? TaskStatus.State.FAILED: TaskStatus.State.KILLED;
+  public void failedTask(
+    TaskInProgress tip,
+    TaskAttemptID taskid,
+    String reason,
+    TaskStatus.Phase phase,
+    boolean isFailed,
+    String trackerName,
+    TaskTrackerInfo ttStatus) {
+    TaskStatus.State state =
+      isFailed ? TaskStatus.State.FAILED: TaskStatus.State.KILLED;
     TaskStatus status = TaskStatus.createTaskStatus(tip.isMapTask(),
                                                     taskid,
                                                     0.0f,
@@ -1470,12 +1669,15 @@ public class CoronaJobInProgress extends JobInProgressTraits {
                                                     reason,
                                                     trackerName, phase,
                                                     new Counters());
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       // update the actual start-time of the attempt
       TaskStatus oldStatus = tip.getTaskStatus(taskid);
       long startTime = oldStatus == null
       ? JobTracker.getClock().getTime()
           : oldStatus.getStartTime();
+      if (startTime < 0) {
+        startTime = JobTracker.getClock().getTime();
+      }
       status.setStartTime(startTime);
       status.setFinishTime(JobTracker.getClock().getTime());
       boolean wasComplete = tip.isComplete();
@@ -1492,10 +1694,10 @@ public class CoronaJobInProgress extends JobInProgressTraits {
 
   @SuppressWarnings("deprecation")
   public void failedTask(TaskInProgress tip, TaskAttemptID taskid,
-                          TaskStatus status, TaskTrackerStatus taskTrackerStatus,
+                          TaskStatus status, TaskTrackerInfo taskTrackerStatus,
                           boolean wasRunning, boolean wasComplete,
                           boolean wasAttemptRunning) {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       failedTaskUnprotected(tip, taskid, status, taskTrackerStatus,
           wasRunning, wasComplete, wasAttemptRunning);
     }
@@ -1515,9 +1717,10 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    */
   @SuppressWarnings("deprecation")
   private void failedTaskUnprotected(TaskInProgress tip, TaskAttemptID taskid,
-                          TaskStatus status, TaskTrackerStatus taskTrackerStatus,
+                          TaskStatus status, TaskTrackerInfo taskTrackerStatus,
                           boolean wasRunning, boolean wasComplete,
                           boolean wasAttemptRunning) {
+    taskErrorCollector.collect(tip, taskid, clock.getTime());
     // check if the TIP is already failed
     boolean wasFailed = tip.isFailed();
 
@@ -1528,20 +1731,35 @@ public class CoronaJobInProgress extends JobInProgressTraits {
     boolean isComplete = tip.isComplete();
 
     if (wasAttemptRunning) {
-      // We are decrementing counters without looking for isRunning ,
-      // because we increment the counters when we obtain
-      // new map task attempt or reduce task attempt.We do not really check
-      // for tip being running.
-      // Whenever we obtain new task attempt following counters are incremented.
-      //      ++runningMapTasks;
-      //.........
-      //      metrics.launchMap(id);
-      // hence we are decrementing the same set.
       if (!tip.isJobCleanupTask() && !tip.isJobSetupTask()) {
+        long timeSpent = clock.getTime() - status.getStartTime();
+        boolean isSpeculative = tip.isSpeculativeAttempt(taskid);
         if (tip.isMapTask()) {
           runningMapTasks -= 1;
+          if (wasFailed) {
+            jobStats.incNumMapTasksFailed();
+            jobStats.incFailedMapTime(timeSpent);
+          } else {
+            jobStats.incNumMapTasksKilled();
+            jobStats.incKilledMapTime(timeSpent);
+            if (isSpeculative) {
+              jobStats.incNumSpeculativeWasteMaps();
+              jobStats.incSpeculativeMapTimeWaste(timeSpent);
+            }
+          }
         } else {
           runningReduceTasks -= 1;
+          if (wasFailed) {
+            jobStats.incNumReduceTasksFailed();
+            jobStats.incFailedReduceTime(timeSpent);
+          } else {
+            jobStats.incNumReduceTasksKilled();
+            jobStats.incKilledReduceTime(timeSpent);
+            if (isSpeculative) {
+              jobStats.incNumSpeculativeWasteReduces();
+              jobStats.incSpeculativeReduceTimeWaste(timeSpent);
+            }
+          }
         }
       }
 
@@ -1707,33 +1925,6 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   }
 
   /**
-   * Get the level of locality that a given task would have if launched on
-   * a particular TaskTracker. Returns 0 if the task has data on that machine,
-   * 1 if it has data on the same rack, etc (depending on number of levels in
-   * the network hierarchy).
-   */
-  int getLocalityLevel(TaskInProgress tip, TaskTrackerStatus tts) {
-    Node tracker = topologyCache.getNode(tts.getHost());
-    int level = this.maxLevel;
-    // find the right level across split locations
-    for (String local : maps[tip.getIdWithinJob()].getSplitLocations()) {
-      Node datanode = topologyCache.getNode(local);
-      int newLevel = this.maxLevel;
-      if (tracker != null && datanode != null) {
-        newLevel = getMatchingLevelForNodes(tracker, datanode);
-      }
-      if (newLevel < level) {
-        level = newLevel;
-        // an optimization
-        if (level == 0) {
-          break;
-        }
-      }
-    }
-    return level;
-  }
-
-  /**
    * Adds the failed TIP in the front of the list for non-running maps
    * @param tip the tip that needs to be failed
    */
@@ -1792,7 +1983,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   }
 
   private void jobComplete() {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       jobCompleteUnprotected();
     }
   }
@@ -1804,7 +1995,11 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   private void jobCompleteUnprotected() {
     //
     // All tasks are complete, then the job is done!
-    //
+    
+    if(this.terminated == JobStatus.FAILED 
+        || this.terminated == JobStatus.KILLED) {
+      terminate(this.terminated);
+    }
     if (this.status.getRunState() == JobStatus.RUNNING ||
         this.status.getRunState() == JobStatus.PREP) {
       changeStateTo(JobStatus.SUCCEEDED);
@@ -1838,7 +2033,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    * Job state change must happen thru this call
    */
   private void changeStateTo(int newState) {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       int oldState = this.status.getRunState();
       if (oldState == newState) {
         return; //old and new states are same
@@ -1882,7 +2077,8 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    *
    * @param tip The tip for which the task is added
    * @param id The attempt-id for the task
-   * @param tts task-tracker status
+   * @param taskTracker task tracker name
+   * @param hostName host name for the task tracker
    * @param isScheduled Whether this task is scheduled from the JT or has
    *        joined back upon restart
    */
@@ -1913,20 +2109,18 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       splits = tip.getSplitNodes();
       if (tip.getActiveTasks().size() > 1) {
         speculativeMapTasks++;
-        if (!garbageCollected) {
-          totalSpeculativeMapTasks.incrementAndGet();
-        }
+        jobStats.incNumSpeculativeMaps();
       }
+      jobStats.incNumMapTasksLaunched();
     } else {
       ++runningReduceTasks;
       name = Values.REDUCE.name();
       counter = Counter.TOTAL_LAUNCHED_REDUCES;
       if (tip.getActiveTasks().size() > 1) {
         speculativeReduceTasks++;
-        if (!garbageCollected) {
-          totalSpeculativeReduceTasks.incrementAndGet();
-        }
+        jobStats.incNumSpeculativeReduces();
       }
+      jobStats.incNumReduceTasksLaunched();
     }
     // Note that the logs are for the scheduled tasks only. Tasks that join on
     // restart has already their logs in place.
@@ -1938,53 +2132,8 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       jobCounters.incrCounter(counter, 1);
     }
 
-    //TODO The only problem with these counters would be on restart.
-    // The jobtracker updates the counter only when the task that is scheduled
-    // if from a non-running tip and is local (data, rack ...). But upon restart
-    // as the reports come from the task tracker, there is no good way to infer
-    // when exactly to increment the locality counters. The only solution is to
-    // increment the counters for all the tasks irrespective of
-    //    - whether the tip is running or not
-    //    - whether its a speculative task or not
-    //
-    // So to simplify, increment the data locality counter whenever there is
-    // data locality.
     if (tip.isMapTask() && !tip.isJobSetupTask() && !tip.isJobCleanupTask()) {
-      // increment the data locality counter for maps
-      Node tracker = topologyCache.getNode(hostName);
-      int level = this.maxLevel;
-      // find the right level across split locations
-      for (String local : maps[tip.getIdWithinJob()].getSplitLocations()) {
-        Node datanode = topologyCache.getNode(local);
-        int newLevel = this.maxLevel;
-        if (tracker != null && datanode != null) {
-          newLevel = getMatchingLevelForNodes(tracker, datanode);
-        }
-        if (newLevel < level) {
-          level = newLevel;
-          // an optimization
-          if (level == 0) {
-            break;
-          }
-        }
-      }
-      switch (level) {
-      case 0 :
-        LOG.info("Choosing data-local task " + tip.getTIPId());
-        jobCounters.incrCounter(Counter.DATA_LOCAL_MAPS, 1);
-        break;
-      case 1:
-        LOG.info("Choosing rack-local task " + tip.getTIPId());
-        jobCounters.incrCounter(Counter.RACK_LOCAL_MAPS, 1);
-        break;
-      default :
-        // check if there is any locality
-        if (level != this.maxLevel) {
-          LOG.info("Choosing cached task at level " + level + tip.getTIPId());
-          jobCounters.incrCounter(Counter.OTHER_LOCAL_MAPS, 1);
-        }
-        break;
-      }
+      localityStats.record(tip, hostName, -1);
     }
   }
 
@@ -2000,7 +2149,8 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   }
 
   private void terminate(int jobTerminationState) {
-    synchronized(lockObject) {
+    this.terminated = jobTerminationState;
+    synchronized (lockObject) {
       terminateUnprotected(jobTerminationState);
     }
   }
@@ -2014,6 +2164,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    * @param jobTerminationState job termination state
    */
   private void terminateUnprotected(int jobTerminationState) {
+    this.terminated = jobTerminationState;
     if(!tasksInited) {
       //init could not be done, we just terminate directly.
       terminateJob(jobTerminationState);
@@ -2044,9 +2195,31 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       }
       for (int i = 0; i < maps.length; i++) {
         maps[i].kill();
+        TreeMap<TaskAttemptID, String> activeTasks = maps[i].getActiveTasksCopy();
+        for (TaskAttemptID attempt : activeTasks.keySet()) {
+          TaskStatus status = maps[i].getTaskStatus(attempt);
+          if (status != null) {
+            failedTask(maps[i], attempt, JOB_KILLED_REASON,
+              status.getPhase(), false, status.getTaskTracker(), null);
+          } else {
+            failedTask(maps[i], attempt, JOB_KILLED_REASON,
+              Phase.MAP, false, EMPTY_TRACKER_NAME, null);
+          }
+        }
       }
       for (int i = 0; i < reduces.length; i++) {
         reduces[i].kill();
+        TreeMap<TaskAttemptID, String> activeTasks = reduces[i].getActiveTasksCopy();
+        for (TaskAttemptID attempt : activeTasks.keySet()) {
+          TaskStatus status = reduces[i].getTaskStatus(attempt);
+          if (status != null) {
+            failedTask(reduces[i], attempt, JOB_KILLED_REASON,
+              status.getPhase(), false, status.getTaskTracker(), null);
+          } else {
+            failedTask(reduces[i], attempt, JOB_KILLED_REASON,
+              Phase.REDUCE, false, EMPTY_TRACKER_NAME, null);
+          }
+        }
       }
 
       // Moved job to a terminal state if no job cleanup is needed. In case the
@@ -2059,7 +2232,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   }
 
   private void terminateJob(int jobTerminationState) {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       terminateJobUnprotected(jobTerminationState);
     }
   }
@@ -2175,6 +2348,16 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   }
 
   /**
+   * Check if the job needs the JobCleanup task launched.
+   * @return true if the job needs a cleanup task launched, false otherwise
+   */
+  public boolean canLaunchJobCleanupTask() {
+    synchronized (lockObject) {
+      return canLaunchJobCleanupTaskUnprotected();
+    }
+  }
+
+  /**
    * Check whether cleanup task can be launched for the job.
    *
    * Cleanup task can be launched if it is not already launched
@@ -2229,13 +2412,17 @@ public class CoronaJobInProgress extends JobInProgressTraits {
    */
   @SuppressWarnings("deprecation")
   public Counters getCounters() {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       Counters result = new Counters();
       result.incrAllCounters(getJobCounters());
 
       incrementTaskCountersUnprotected(result, maps);
       return incrementTaskCountersUnprotected(result, reduces);
     }
+  }
+
+  public Counters getErrorCounters() {
+    return taskErrorCollector.getErrorCountsCounters();
   }
 
   public Object getSchedulingInfo() {
@@ -2251,7 +2438,7 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   }
 
   void completeSetup() {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       setupCompleteUnprotected();
     }
   }
@@ -2332,9 +2519,9 @@ public class CoronaJobInProgress extends JobInProgressTraits {
     return tasksInited;
   }
 
-  private void updateTaskTrackerStats(TaskInProgress tip, TaskTrackerStatus ttStatus,
+  private void updateTaskTrackerStats(TaskInProgress tip, TaskTrackerInfo ttStatus,
       Map<String,DataStatistics> trackerStats, DataStatistics overallStats) {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       float tipDuration = tip.getExecFinishTime() -
       tip.getDispatchTime(tip.getSuccessfulTaskid());
       DataStatistics ttStats =
@@ -2363,34 +2550,62 @@ public class CoronaJobInProgress extends JobInProgressTraits {
   @Override
   public Vector<TaskInProgress> reportTasksInProgress(boolean shouldBeMap,
                                                       boolean shouldBeComplete) {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       return super.reportTasksInProgress(shouldBeMap, shouldBeComplete);
     }
   }
 
   @Override
   public Vector<TaskInProgress> reportCleanupTIPs(boolean shouldBeComplete) {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       return super.reportCleanupTIPs(shouldBeComplete);
     }
   }
 
   @Override
   public Vector<TaskInProgress> reportSetupTIPs(boolean shouldBeComplete) {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       return super.reportSetupTIPs(shouldBeComplete);
     }
   }
 
   @Override
   public TaskInProgress getTaskInProgress(TaskID tipid) {
-    synchronized(lockObject) {
+    synchronized (lockObject) {
       return super.getTaskInProgress(tipid);
     }
   }
 
   public Configuration getConf() {
     return jobConf;
+  }
+
+  @Override
+  public boolean shouldLogCannotspeculativeMaps() {
+    long now = clock.getTime();
+    if ((now - lastTimeCannotspeculativeMapLog) <= logCannotspeculativeInterval)
+        return false;
+    int unfinished = numMapTasks - finishedMapTasks;
+    if (unfinished <= numMapTasks * speculativeMapLogRateThreshold ||
+        unfinished <= speculativeMapLogNumThreshold) {
+        lastTimeCannotspeculativeMapLog = now; 
+        return true;
+    }
+    return false;
+  }
+
+  @Override
+  public boolean shouldLogCannotspeculativeReduces() {
+    long now = clock.getTime();
+    if ((now - lastTimeCannotspeculativeReduceLog) <= logCannotspeculativeInterval)
+      return false;
+    int unfinished = numReduceTasks - finishedReduceTasks;
+    if (unfinished <= numReduceTasks * speculativeReduceLogRateThreshold ||
+        unfinished <= speculativeReduceLogNumThreshold) {
+        lastTimeCannotspeculativeReduceLog = now; 
+        return true;
+    }
+    return false;
   }
 
   @Override
@@ -2411,5 +2626,20 @@ public class CoronaJobInProgress extends JobInProgressTraits {
       return true;
     }
     return false;
+  }
+
+  @Override
+  DataStatistics getRunningTaskStatistics(Phase phase) {
+    throw new RuntimeException("Not yet implemented.");
+  }
+
+  public static void uploadCachedSplits(JobID jobId, JobConf jobConf,
+      String systemDir) throws IOException {
+    Path jobDir = new Path(systemDir, jobId.toString());
+    Path splitFile = new Path(jobDir, "job.split");
+    LOG.info("Uploading splits file for " + jobId + " to " + splitFile);
+    List<JobClient.RawSplit> splits = Arrays.asList(JobClient
+        .getAndRemoveCachedSplits(jobId));
+    JobClient.writeComputedSplits(jobConf, splits, splitFile);
   }
 }
