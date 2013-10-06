@@ -23,8 +23,6 @@ import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
-import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
-import org.apache.hadoop.hdfs.server.namenode.BlockPlacementPolicy.NotEnoughReplicasException;
 import org.apache.hadoop.net.DNSToSwitchMapping;
 import org.apache.hadoop.net.NetworkTopology;
 import org.apache.hadoop.net.Node;
@@ -45,6 +43,7 @@ import java.util.*;
 public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
   protected NetworkTopology clusterMap;
   private int attemptMultiplier = 0;
+  private int minBlocksToWrite = FSConstants.MIN_BLOCKS_FOR_WRITE;
 
   BlockPlacementPolicyNetAware(Configuration conf, FSClusterStats stats,
       NetworkTopology clusterMap) {
@@ -62,6 +61,8 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     // First, set oldFactor in the superclass BlockPlacementPolicy
     super.oldFactor = conf.getFloat("dfs.replication.netaware.oldfactor", (float) 0.2);
     // Then, do everything else
+    this.minBlocksToWrite = conf.getInt("dfs.replication.minBlocksToWrite",
+        FSConstants.MIN_BLOCKS_FOR_WRITE);
     this.clusterMap = clusterMap;
     Configuration newConf = new Configuration();
     this.attemptMultiplier = newConf.getInt("dfs.replication.attemptMultiplier", 200);
@@ -103,9 +104,6 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     return chooseTarget(numOfReplicas, writer, chosenNodes, null, blocksize);
   }
 
-  /**
-   * This is not part of the public API but is used by the unit tests.
-   */
   synchronized DatanodeDescriptor[] chooseTarget(int numOfReplicas,
                                     DatanodeDescriptor writer,
                                     List<DatanodeDescriptor> chosenNodes,
@@ -317,12 +315,13 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     int oldNumOfReplicas = results.size();
     // choose a node using network awareness
     try {
-      chooseNetworkAware(numOfReplicas, "~"+localMachine.getNetworkLocation(),
-                   excludedNodes, blocksize, maxReplicasPerRack, results, localMachine);
+      chooseNetworkAware(numOfReplicas,
+          "~" + localMachine.getNetworkLocation(), excludedNodes, blocksize,
+          maxReplicasPerRack, results, localMachine);
     } catch (NotEnoughReplicasException e) {
-      chooseNetworkAware(numOfReplicas-(results.size()-oldNumOfReplicas),
-                   localMachine.getNetworkLocation(), excludedNodes, blocksize, 
-                   maxReplicasPerRack, results, localMachine);
+      chooseNetworkAware(numOfReplicas - (results.size() - oldNumOfReplicas),
+          localMachine.getNetworkLocation(), excludedNodes, blocksize,
+          maxReplicasPerRack, results, localMachine);
     }
   }
 
@@ -337,11 +336,12 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
                                           List<DatanodeDescriptor> results,
                                           DatanodeDescriptor localMachine) 
     throws NotEnoughReplicasException {
-    int numOfAvailableNodes =
-      clusterMap.countNumOfAvailableNodes(nodes, excludedNodes.keySet());
-    while(numOfAvailableNodes > 0) {
-      DatanodeDescriptor chosenNode = 
-        pickMinLoadedNode(clusterMap.getAvailableLeaves(nodes, excludedNodes.keySet()), localMachine, blocksize);
+    int numOfAvailableNodes = clusterMap.countNumOfAvailableNodes(nodes,
+        excludedNodes.keySet());
+    while (numOfAvailableNodes > 0) {
+      DatanodeDescriptor chosenNode = pickMinLoadedNode(
+          clusterMap.getAvailableLeaves(nodes, excludedNodes.keySet()),
+          localMachine, maxNodesPerRack, blocksize);
 
       Node oldNode = excludedNodes.put(chosenNode, chosenNode);
       if (oldNode == null) { // chosenNode was not in the excluded list
@@ -351,8 +351,7 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
       }
     }
 
-    throw new NotEnoughReplicasException(
-        "Not able to place enough replicas");
+    throw new NotEnoughReplicasException("Not able to place enough replicas");
   }
    
   /* Choose <i>numOfReplicas</i> targets from <i>nodes</i> with network awareness.
@@ -365,13 +364,13 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
                     List<DatanodeDescriptor> results,
                     DatanodeDescriptor localMachine)
     throws NotEnoughReplicasException {
-
-    int numOfAvailableNodes =
-      clusterMap.countNumOfAvailableNodes(nodes, excludedNodes.keySet());
+    int numOfAvailableNodes = clusterMap.countNumOfAvailableNodes(nodes,
+        excludedNodes.keySet());
     int numAttempts = numOfAvailableNodes * this.attemptMultiplier;
-    while(numOfReplicas > 0 && numOfAvailableNodes > 0 && --numAttempts > 0) {
-      DatanodeDescriptor chosenNode = 
-        pickMinLoadedNode(clusterMap.getAvailableLeaves(nodes, excludedNodes.keySet()), localMachine, blocksize);
+    while (numOfReplicas > 0 && numOfAvailableNodes > 0 && --numAttempts > 0) {
+      DatanodeDescriptor chosenNode = pickMinLoadedNode(
+          clusterMap.getAvailableLeaves(nodes, excludedNodes.keySet()),
+          localMachine, maxNodesPerRack, blocksize);
       Node oldNode = excludedNodes.put(chosenNode, chosenNode);
       if (oldNode == null) {
         numOfAvailableNodes--;
@@ -379,10 +378,9 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
         results.add(chosenNode);
       }
     }
-      
-    if (numOfReplicas>0) {
-      throw new NotEnoughReplicasException(
-                                           "Not able to place enough replicas");
+
+    if (numOfReplicas > 0) {
+      throw new NotEnoughReplicasException("Not able to place enough replicas");
     }
   }
 
@@ -391,56 +389,62 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
    * @param candidates 
    * @return
    */
-  private DatanodeDescriptor pickMinLoadedNode(
-                                            Collection<Node> candidates, 
-                                            DatanodeDescriptor localMachine, 
-                                            long blocksize) {
+  private DatanodeDescriptor pickMinLoadedNode(Collection<Node> candidates, 
+                                               DatanodeDescriptor localMachine, 
+                                               int maxNodesPerRack,
+                                               long blocksize) {
     double minRxBps = Double.MAX_VALUE;
     Node retVal = null;
-    
-    // Cap at source's txBps
-    // double maxRxBps = dnNameToTxBpsMap.get(localMachine.getName());
-    
-    for (Node cand: candidates) {
+
+    for (Node cand : candidates) {
       Double candRxBps = getDnRxBps(cand.getName());
       if (candRxBps == null) {
         candRxBps = Double.MAX_VALUE;
       }
-      if (candRxBps <= minRxBps 
-          && isGoodTarget(localMachine, blocksize)
-          // && (retVal == null || candRxBps >= maxRxBps)
-          ) {
-        
+      if (candRxBps <= minRxBps
+          && isGoodTarget(localMachine, blocksize, maxNodesPerRack)) {
         retVal = cand;
         minRxBps = candRxBps;
       }
-      // LOG.info("pickMinLoadedNode examining " + cand.getName() + " with RxBps = " + candRxBps);
     }
-    // LOG.info("pickMinLoadedNode selected " + retVal.getName() + " with RxBps = " + minRxBps);
     return (DatanodeDescriptor) retVal;
   }
   
   /* judge if a node is a good target.
-   * return true if <i>node</i> has enough space
+   * return true if <i>node</i> has enough space, 
+   * and does not have too much load.
    */
-  protected boolean isGoodTarget(
-                               DatanodeDescriptor node,
-                               long blockSize) {
-    
+  protected boolean isGoodTarget(DatanodeDescriptor node,
+                                 long blockSize, 
+                                 int maxTargetPerLoc) {
     Log logr = FSNamesystem.LOG;
-    long remaining = node.getRemaining() - 
-                     (node.getBlocksScheduled() * blockSize); 
-    // check the remaining capacity of the target machine
-    if (blockSize* FSConstants.MIN_BLOCKS_FOR_WRITE>remaining) {
+    // check if the node is (being) decommissioned
+    if (node.isDecommissionInProgress() || node.isDecommissioned()) {
       if (logr.isDebugEnabled()) {
-        logr.debug("Node "+ NodeBase.getPath(node) +
-                " is not chosen because the node does not have enough space" +
-                " for block size " + blockSize +
-                " with Remaining = " + node.getRemaining() + 
-                " and Scheduled = " + node.getBlocksScheduled());
+        logr.debug("Node " + NodeBase.getPath(node)
+            + " is not chosen because the node is (being) decommissioned");
       }
       return false;
     }
+
+    long remaining = node.getRemaining()
+        - (node.getBlocksScheduled() * blockSize);
+    // check the remaining capacity of the target machine
+    if (blockSize * this.minBlocksToWrite > remaining) {
+      if (logr.isDebugEnabled()) {
+        logr.debug("Node " + NodeBase.getPath(node)
+            + " is not chosen because the node does not have enough space"
+            + " for block size " + blockSize + " with Remaining = "
+            + node.getRemaining() + " and Scheduled = "
+            + node.getBlocksScheduled());
+      }
+      return false;
+    }
+
+    if (DatanodeInfo.shouldSuspectNodes() && node.isSuspectFail()) {
+      return false;
+    }
+
     return true;
   }
 
@@ -449,30 +453,30 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
    * starts from the writer and traverses all <i>nodes</i>
    * This is basically a traveling salesman problem.
    */
-  protected DatanodeDescriptor[] getPipeline(
-                                           DatanodeDescriptor writer,
-                                           DatanodeDescriptor[] nodes) {
-    if (nodes.length==0) return nodes;
-      
-    synchronized(clusterMap) {
-      int index=0;
+  protected DatanodeDescriptor[] getPipeline(DatanodeDescriptor writer,
+                                             DatanodeDescriptor[] nodes) {
+    if (nodes.length == 0)
+      return nodes;
+
+    synchronized (clusterMap) {
+      int index = 0;
       if (writer == null || !clusterMap.contains(writer)) {
         writer = nodes[0];
       }
-      for(;index<nodes.length; index++) {
+      for (; index < nodes.length; index++) {
         DatanodeDescriptor shortestNode = nodes[index];
         int shortestDistance = clusterMap.getDistance(writer, shortestNode);
         int shortestIndex = index;
-        for(int i=index+1; i<nodes.length; i++) {
+        for (int i = index + 1; i < nodes.length; i++) {
           DatanodeDescriptor currentNode = nodes[i];
           int currentDistance = clusterMap.getDistance(writer, currentNode);
-          if (shortestDistance>currentDistance) {
+          if (shortestDistance > currentDistance) {
             shortestDistance = currentDistance;
             shortestNode = currentNode;
             shortestIndex = i;
           }
         }
-        //switch position index & shortestIndex
+        // switch position index & shortestIndex
         if (index != shortestIndex) {
           nodes[shortestIndex] = nodes[index];
           nodes[index] = shortestNode;
@@ -491,7 +495,7 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     if (locs == null)
       locs = new DatanodeInfo[0];
     int numRacks = clusterMap.getNumOfRacks();
-    if(numRacks <= 1) // only one rack
+    if (numRacks <= 1) // only one rack
       return 0;
     minRacks = Math.min(minRacks, numRacks);
     // 1. Check that all locations are different.
@@ -504,10 +508,10 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
 
   /** {@inheritDoc} */
   public DatanodeDescriptor chooseReplicaToDelete(FSInodeInfo inode,
-                                                 Block block,
-                                                 short replicationFactor,
-                                                 Collection<DatanodeDescriptor> first, 
-                                                 Collection<DatanodeDescriptor> second) {
+                                                  Block block,
+                                                  short replicationFactor,
+                                                  Collection<DatanodeDescriptor> first, 
+                                                  Collection<DatanodeDescriptor> second) {
     long minSpace = Long.MAX_VALUE;
     DatanodeDescriptor cur = null;
 
@@ -517,7 +521,7 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
           first.isEmpty() ? second.iterator() : first.iterator();
 
     // pick node with least free space
-    while (iter.hasNext() ) {
+    while (iter.hasNext()) {
       DatanodeDescriptor node = iter.next();
       long free = node.getRemaining();
       if (minSpace > free) {
@@ -527,5 +531,4 @@ public class BlockPlacementPolicyNetAware extends BlockPlacementPolicy {
     }
     return cur;
   }
-
 }

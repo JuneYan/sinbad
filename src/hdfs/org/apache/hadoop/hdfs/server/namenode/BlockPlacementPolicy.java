@@ -35,8 +35,8 @@ import java.util.*;
  */
 public abstract class BlockPlacementPolicy {
   
-  // Keep track of the Configuration
-  static Configuration confCopy = null;
+  // Keep track of the heartbeat duration in seconds
+  static int heartbeatSeconds = 0;
   
   private class BpsInfo {
     double bps = 0.0;
@@ -66,7 +66,7 @@ public abstract class BlockPlacementPolicy {
       
       // Calculate the expected time till the next update
       double secElapsed = (now() - lastUpdateTime) / 1000.0;
-      double timeTillUpdate = 1.0 * confCopy.getInt("dfs.heartbeat.interval", 1) - secElapsed;
+      double timeTillUpdate = 1.0 * heartbeatSeconds - secElapsed;
 
       // Bound incVal by blockSize
       if (timeTillUpdate > 0.0) {
@@ -88,9 +88,11 @@ public abstract class BlockPlacementPolicy {
   
   // Keep track of receiving throughput at each DataNode
   private Map<String, BpsInfo> dnNameToRxBpsMap = Collections.synchronizedMap(new HashMap<String, BpsInfo>());
-  // private Map<String, Double> dnNameToTxBpsMap = Collections.synchronizedMap(new HashMap<String, Double>());
   
-  public double oldFactor = 0.0;
+  // Actual value is set in BlockPlacementPolicyNetAware because abstract class 
+  // BlockPlacementPolicy does not have a Configuration object. 
+  // Not sure if just creating a new Configuration object would work.
+  public double oldFactor = 0.2;
 
   public static class NotEnoughReplicasException extends Exception {
     private static final long serialVersionUID = 1L;
@@ -238,8 +240,8 @@ public abstract class BlockPlacementPolicy {
                                                  HostsFileReader hostsReader,
                                                  DNSToSwitchMapping dnsToSwitchMapping,
                                                  FSNamesystem namesystem) {
-    // Store the configuration
-    BlockPlacementPolicy.confCopy = conf;
+    // Store heartbeat duration
+    BlockPlacementPolicy.heartbeatSeconds = conf.getInt("dfs.heartbeat.interval", 1);
     
     Class<? extends BlockPlacementPolicy> replicatorClass =
                       conf.getClass("dfs.block.replicator.classname",
@@ -280,25 +282,33 @@ public abstract class BlockPlacementPolicy {
    * @param rxBps receiving throughout of the DataNode
    * @param txBps transmitting throughput of the DataNode
    */
-  public void updateNetworkInformation(String dnName, double newRxBps, double newTxBps) {
+  public void updateNetworkInformation(String dnName, 
+                                       double newRxBps, 
+                                       double newTxBps) {
     BpsInfo bpsInfo = (dnNameToRxBpsMap.containsKey(dnName)) ? dnNameToRxBpsMap.get(dnName) : new BpsInfo();
     double rxBps = (1.0 - this.oldFactor) * newRxBps + this.oldFactor * bpsInfo.bps;
     bpsInfo.resetToNormal(rxBps);
     dnNameToRxBpsMap.put(dnName, bpsInfo);
-
-    // double oldTxBps = (dnNameToTxBpsMap.containsKey(dnName)) ? dnNameToTxBpsMap.get(dnName) : 0.0;
-    // double txBps = (1.0 - this.oldFactor) * newTxBps + this.oldFactor * oldTxBps;
-    // dnNameToTxBpsMap.put(dnName, txBps);
-
-    // LOG.info(dnName + ": updatedRxBps = " + rxBps + " oldRxBps = " + oldRxBps + " oldFactor = " + this.oldFactor);
 }
   
+  /**
+   * Adjust bps based on blockSize
+   * 
+   * @param dnName path to DataNode
+   * @param blockSize size of the block being written in bytes
+   */
   public void adjustRxBps(String dnName, double blockSize) {
     BpsInfo bpsInfo = (dnNameToRxBpsMap.containsKey(dnName)) ? dnNameToRxBpsMap.get(dnName) : new BpsInfo();
     bpsInfo.moveToTemp(blockSize);
     dnNameToRxBpsMap.put(dnName, bpsInfo);
   }
   
+  /**
+   * Get rxBps for a given datanode
+   * 
+   * @param dnName path to DataNode
+   * @return rxBps of dnName 
+   */
   public double getDnRxBps(String dnName) {
     BpsInfo bpsInfo = dnNameToRxBpsMap.containsKey(dnName) ? dnNameToRxBpsMap.get(dnName) : new BpsInfo();
     return bpsInfo.isTemp ? bpsInfo.tempBps : bpsInfo.bps;
